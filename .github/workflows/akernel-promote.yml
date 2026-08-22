@@ -1,0 +1,198 @@
+name: Promote AKernel Firecracker candidate
+
+run-name: Promote candidate run ${{ inputs.candidate_run_id }}
+
+"on":
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful AKernel Firecracker candidate workflow run ID
+        required: true
+        type: string
+
+concurrency:
+  group: akernel-firecracker-promote
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  promote:
+    if: github.ref_name == 'develop'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate run ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${CANDIDATE_RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "invalid candidate run ID: ${CANDIDATE_RUN_ID}" >&2
+            exit 1
+          fi
+
+      - name: Download candidate
+        uses: actions/download-artifact@v8
+        with:
+          name: firecracker-candidate-${{ inputs.candidate_run_id }}
+          path: ${{ runner.temp }}/firecracker-candidate
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - name: Validate candidate
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          candidate_dir="${RUNNER_TEMP}/firecracker-candidate"
+          manifest="$(find "${candidate_dir}" -maxdepth 1 -type f \
+            -name 'firecracker-v*-akernel.*-x86_64.manifest.json' -print)"
+          test -n "${manifest}"
+          test "$(printf '%s\n' "${manifest}" | wc -l)" = "1"
+
+          repository="$(jq -er '.repository' "${manifest}")"
+          commit="$(jq -er '.commit' "${manifest}")"
+          release_tag="$(jq -er '.release_tag' "${manifest}")"
+          manifest_run_id="$(jq -er '.workflow_run_id' "${manifest}")"
+          vmm_version="$(jq -er '.vmm.version' "${manifest}")"
+          kernel_tag="$(jq -er '.guest_kernel.source_tag' "${manifest}")"
+
+          test "$(jq -er '.component' "${manifest}")" = \
+            "akernel-firecracker-runtime"
+          test "${repository}" = "${GITHUB_REPOSITORY}"
+          test "${manifest_run_id}" = "${CANDIDATE_RUN_ID}"
+          [[ "${commit}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-akernel\.[0-9]+$ ]]
+          test "${vmm_version}" = "${release_tag%-akernel.*}"
+          test "$(jq -er '.vmm.source' "${manifest}")" = \
+            "official-release"
+
+          archive="${candidate_dir}/firecracker-${release_tag}-x86_64.tgz"
+          archive_checksum="${archive}.sha256"
+          test -f "${archive}"
+          test -f "${archive_checksum}"
+          (
+            cd "${candidate_dir}"
+            sha256sum --check "$(basename "${archive_checksum}")"
+          )
+
+          run_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}")"
+          test "$(jq -r '.path' <<<"${run_json}")" = \
+            ".github/workflows/akernel-candidate.yml"
+          test "$(jq -r '.event' <<<"${run_json}")" = "workflow_dispatch"
+          test "$(jq -r '.conclusion' <<<"${run_json}")" = "success"
+          test "$(jq -r '.head_branch' <<<"${run_json}")" = "develop"
+          test "$(jq -r '.head_sha' <<<"${run_json}")" = "${commit}"
+
+          git fetch origin develop
+          git cat-file -e "${commit}^{commit}"
+          git merge-base --is-ancestor "${commit}" origin/develop
+
+          extract_dir="${RUNNER_TEMP}/firecracker-extracted"
+          mkdir "${extract_dir}"
+          tar -xzf "${archive}" -C "${extract_dir}"
+          bundle_dir="${extract_dir}/release-${release_tag}-x86_64"
+          (
+            cd "${bundle_dir}"
+            sha256sum --check SHA256SUMS
+          )
+          "${bundle_dir}/firecracker" --version |
+            grep -F "Firecracker ${vmm_version}"
+          test "$(sha256sum "${bundle_dir}/firecracker" | cut -d ' ' -f 1)" = \
+            "$(jq -er '.vmm.binary_sha256' "${manifest}")"
+          test "$(sha256sum "${bundle_dir}/vmlinux" | cut -d ' ' -f 1)" = \
+            "$(jq -er '.guest_kernel.image_sha256' "${manifest}")"
+
+          if gh release view "${release_tag}" \
+            --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "release already exists: ${release_tag}" >&2
+            exit 1
+          fi
+
+          echo "commit=${commit}" >>"${GITHUB_OUTPUT}"
+          echo "release_tag=${release_tag}" >>"${GITHUB_OUTPUT}"
+          echo "vmm_version=${vmm_version}" >>"${GITHUB_OUTPUT}"
+          echo "kernel_tag=${kernel_tag}" >>"${GITHUB_OUTPUT}"
+          echo "archive=${archive}" >>"${GITHUB_OUTPUT}"
+          echo "archive_checksum=${archive_checksum}" >>"${GITHUB_OUTPUT}"
+          echo "manifest=${manifest}" >>"${GITHUB_OUTPUT}"
+
+      - name: Create release tag
+        shell: bash
+        env:
+          COMMIT: ${{ steps.candidate.outputs.commit }}
+          RELEASE_TAG: ${{ steps.candidate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code --tags origin \
+            "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git fetch --force origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "${COMMIT}"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email \
+              "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag --annotate "${RELEASE_TAG}" "${COMMIT}" \
+              --message "AKernel Firecracker ${RELEASE_TAG}"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
+
+      - name: Publish prerelease
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.candidate.outputs.archive }}
+          ARCHIVE_CHECKSUM: ${{ steps.candidate.outputs.archive_checksum }}
+          MANIFEST: ${{ steps.candidate.outputs.manifest }}
+          RELEASE_TAG: ${{ steps.candidate.outputs.release_tag }}
+          VMM_VERSION: ${{ steps.candidate.outputs.vmm_version }}
+          KERNEL_TAG: ${{ steps.candidate.outputs.kernel_tag }}
+        run: |
+          set -euo pipefail
+
+          notes="${RUNNER_TEMP}/release-notes.md"
+          {
+            echo "AKernel runtime bundle using the official Firecracker ${VMM_VERSION} VMM."
+            echo
+            echo "The guest kernel is built from Amazon Linux ${KERNEL_TAG} with the AKernel EROFS configuration fragment."
+            echo
+            echo "Candidate workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}"
+            echo
+            echo "Source commit: ${{ steps.candidate.outputs.commit }}"
+          } >"${notes}"
+
+          gh release create "${RELEASE_TAG}" \
+            "${ARCHIVE}" \
+            "${ARCHIVE_CHECKSUM}" \
+            "${MANIFEST}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "AKernel Firecracker ${RELEASE_TAG}" \
+            --notes-file "${notes}" \
+            --prerelease \
+            --latest=false
+
+      - name: Summarize release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.candidate.outputs.release_tag }}
+        run: |
+          {
+            echo "### Published AKernel Firecracker prerelease"
+            echo
+            echo "- Candidate run: ${CANDIDATE_RUN_ID}"
+            echo "- Release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          } >>"${GITHUB_STEP_SUMMARY}"

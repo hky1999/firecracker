@@ -1,0 +1,139 @@
+name: AKernel Firecracker candidate
+
+run-name: Build candidate ${{ inputs.release_tag }}
+
+"on":
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Planned AKernel Firecracker release tag
+        required: true
+        default: v1.16.1-akernel.0
+        type: string
+
+concurrency:
+  group: akernel-firecracker-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.ref_name == 'develop'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-akernel\.[0-9]+$ ]]; then
+            echo "invalid release tag: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          source resources/akernel/runtime-versions.env
+          upstream_tag="${RELEASE_TAG%-akernel.*}"
+          test "${upstream_tag}" = "v${FIRECRACKER_VERSION}"
+          git fetch --force --no-tags \
+            https://github.com/firecracker-microvm/firecracker.git \
+            "refs/tags/${upstream_tag}:refs/tags/${upstream_tag}"
+          git merge-base --is-ancestor "${upstream_tag}" "${GITHUB_SHA}"
+
+          if git ls-remote --exit-code --tags origin \
+            "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "release tag already exists: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+      - name: Install guest kernel build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo -E apt-get update
+          sudo -E apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            ca-certificates \
+            curl \
+            file \
+            flex \
+            jq \
+            libelf-dev \
+            libssl-dev
+
+      - name: Build runtime bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          resources/akernel/build-runtime-bundle.sh \
+            "${RELEASE_TAG}" \
+            "${RUNNER_TEMP}/firecracker-candidate"
+
+      - name: Verify candidate bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          candidate_dir="${RUNNER_TEMP}/firecracker-candidate"
+          archive="firecracker-${RELEASE_TAG}-x86_64.tgz"
+          manifest="firecracker-${RELEASE_TAG}-x86_64.manifest.json"
+          cd "${candidate_dir}"
+          sha256sum --check "${archive}.sha256"
+
+          test "$(jq -er '.component' "${manifest}")" = \
+            "akernel-firecracker-runtime"
+          test "$(jq -er '.repository' "${manifest}")" = \
+            "${GITHUB_REPOSITORY}"
+          test "$(jq -er '.commit' "${manifest}")" = "${GITHUB_SHA}"
+          test "$(jq -er '.workflow_run_id' "${manifest}")" = \
+            "${GITHUB_RUN_ID}"
+          test "$(jq -er '.release_tag' "${manifest}")" = "${RELEASE_TAG}"
+          test "$(jq -er '.vmm.source' "${manifest}")" = \
+            "official-release"
+
+          mkdir extracted
+          tar -xzf "${archive}" -C extracted
+          bundle_dir="extracted/release-${RELEASE_TAG}-x86_64"
+          (
+            cd "${bundle_dir}"
+            sha256sum --check SHA256SUMS
+          )
+          "${bundle_dir}/firecracker" --version |
+            grep -F "Firecracker ${RELEASE_TAG%-akernel.*}"
+          file "${bundle_dir}/vmlinux" |
+            grep -F "ELF 64-bit LSB executable"
+
+      - name: Upload candidate
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: firecracker-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/firecracker-candidate/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Summarize candidate
+        shell: bash
+        run: |
+          {
+            echo "### AKernel Firecracker candidate"
+            echo
+            echo "- Run ID: ${GITHUB_RUN_ID}"
+            echo "- Planned release: ${RELEASE_TAG}"
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Artifact digest: ${{ steps.upload.outputs.artifact-digest }}"
+            echo "- Artifact: ${{ steps.upload.outputs.artifact-url }}"
+          } >>"${GITHUB_STEP_SUMMARY}"
