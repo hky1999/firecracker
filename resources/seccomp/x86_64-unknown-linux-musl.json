@@ -36,6 +36,10 @@
                 "comment": "Used by the VirtIO net device to write to tap"
             },
             {
+                "syscall": "pwrite64",
+                "comment": "Used by the incremental snapshot in-place memory write path"
+            },
+            {
                 "syscall": "readv",
                 "comment": "Used by the VirtIO net device to read from tap"
             },
