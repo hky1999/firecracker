@@ -6,8 +6,8 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
@@ -34,11 +34,15 @@ use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
-    GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState,
-    GuestRegionMmap, GuestRegionMmapExt, MemoryError,
+    GuestAddress, GuestMemory, GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion,
+    GuestMemoryState, GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
+use crate::vstate::pagemap_anon::{self, MemoryRange, filter_memory_ranges_by_pagemap_anon};
 use crate::vstate::resources::ResourceAllocator;
-use crate::vstate::soft_dirty::SoftDirtyAccounting;
+use crate::vstate::soft_dirty::{
+    IntersectionError, SoftDirtyAccounting, filter_memory_ranges_by_anon_and_soft_dirty,
+    filter_memory_ranges_by_soft_dirty,
+};
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 
@@ -583,6 +587,19 @@ impl KvmVm {
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
 
+        // The incremental flavors overwrite an existing base in place
+        // (caller-prepared, typically a reflink clone of the restore memory
+        // file). A missing base is an explicit contract violation: silently
+        // creating a zero file would produce a snapshot missing every page
+        // the guest only ever read from the restore file.
+        if matches!(
+            snapshot_type,
+            SnapshotType::Incremental | SnapshotType::SoftDirty
+        ) && !file_existed
+        {
+            return Err(BaseMemoryFileMissing(mem_file_path.to_path_buf()));
+        }
+
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -600,14 +617,27 @@ impl KvmVm {
                 .map_err(|e| MemoryBackingFile("get_metadata", e))?
                 .len();
 
-            // Here we only truncate the file if the size mismatches.
-            // - For full snapshots, the entire file's contents will be overwritten anyway. We have
-            //   to avoid truncating here to deal with the edge case where it represents the
-            //   snapshot file from which this very microVM was loaded (as modifying the memory file
-            //   would be reflected in the mmap of the file, meaning a truncate operation would zero
-            //   out guest memory, and thus corrupt the VM).
-            // - For diff snapshots, we want to merge the diff layer directly into the file.
             if file_size != expected_size {
+                // Incremental flavors patch a caller-prepared base in place;
+                // a size-mismatched base would silently corrupt it.
+                if matches!(
+                    snapshot_type,
+                    SnapshotType::Incremental | SnapshotType::SoftDirty
+                ) {
+                    return Err(BaseMemoryFileSizeMismatch {
+                        path: mem_file_path.to_path_buf(),
+                        actual: file_size,
+                        expected: expected_size,
+                    });
+                }
+
+                // Here we only truncate the file if the size mismatches.
+                // - For full snapshots, the entire file's contents will be overwritten anyway. We have
+                //   to avoid truncating here to deal with the edge case where it represents the
+                //   snapshot file from which this very microVM was loaded (as modifying the memory file
+                //   would be reflected in the mmap of the file, meaning a truncate operation would zero
+                //   out guest memory, and thus corrupt the VM).
+                // - For diff snapshots, we want to merge the diff layer directly into the file.
                 file.set_len(0)
                     .map_err(|err| MemoryBackingFile("truncate", err))?;
             }
@@ -627,12 +657,156 @@ impl KvmVm {
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }
+            SnapshotType::Incremental | SnapshotType::SoftDirty => {
+                self.snapshot_memory_incremental(&mut file, snapshot_type)?;
+            }
         };
 
         file.flush()
             .map_err(|err| MemoryBackingFile("flush", err))?;
         file.sync_all()
             .map_err(|err| MemoryBackingFile("sync_all", err))
+    }
+
+    /// Writes the ledger-selected pages of guest memory into the existing
+    /// base memory file, in place (M1-F3).
+    ///
+    /// The file keeps the plain full-memory layout of a `Full` snapshot, so
+    /// restores need no changes: the base is expected to already contain the
+    /// read-only pages (reflink clone of the restore file, or a fresh zero
+    /// file for a fresh-boot VM), and this pass overwrites exactly the pages
+    /// the chosen ledger reports as guest-written.
+    ///
+    /// Arming stays ack-driven: the soft-dirty window is (re)opened only
+    /// after the delta is durably written, and a failed write disarms so the
+    /// next snapshot rewrites the full anon baseline instead of trusting a
+    /// window whose start was lost.
+    fn snapshot_memory_incremental(
+        &self,
+        file: &mut File,
+        snapshot_type: SnapshotType,
+    ) -> Result<(), CreateSnapshotError> {
+        use self::CreateSnapshotError::*;
+
+        let guest_memory = self.guest_memory();
+        let accounting = &self.common.soft_dirty_accounting;
+        let full_ranges: Vec<MemoryRange> = guest_memory
+            .iter()
+            .map(|region| MemoryRange {
+                gpa: region.start_addr().0,
+                length: region.len(),
+            })
+            .collect();
+        let mappings = memory_file_mappings(guest_memory);
+
+        match snapshot_type {
+            SnapshotType::Incremental => {
+                let (ranges, stats) =
+                    match filter_memory_ranges_by_pagemap_anon(guest_memory, &full_ranges) {
+                        Ok(ok) => ok,
+                        Err(e) => {
+                            // An unusable anon ledger is final for this mode.
+                            accounting.note_ledger_unusable();
+                            return Err(e.into());
+                        }
+                    };
+                debug!(
+                    "Incremental snapshot: {} anon ranges, {} of {} pages",
+                    ranges.len(),
+                    stats.anon_pages,
+                    stats.total_pages
+                );
+                write_ranges_at_offsets(guest_memory, &mappings, file, &ranges)
+                    .map_err(|e| MemoryBackingFile("write_all_at", e))?;
+                Ok(())
+            }
+            SnapshotType::SoftDirty => {
+                if accounting.is_armed() {
+                    // Window delta: intersection of the cumulative anon set
+                    // with the soft-dirty window. If the anon half is
+                    // unusable (kpageflags needs CAP_SYS_ADMIN), degrade to
+                    // the plain soft-dirty window: a superset of the minimal
+                    // delta, never a subset.
+                    let (ranges, stats) = match filter_memory_ranges_by_anon_and_soft_dirty(
+                        guest_memory,
+                        &full_ranges,
+                    ) {
+                        Ok(ok) => ok,
+                        Err(IntersectionError::Anon(
+                            pagemap_anon::PagemapAnonError::NoCapSysAdmin,
+                        )) => {
+                            accounting.note_ledger_unusable();
+                            filter_memory_ranges_by_soft_dirty(guest_memory, &full_ranges)?
+                        }
+                        Err(IntersectionError::Anon(
+                            pagemap_anon::PagemapAnonError::OpenFailed { path, .. },
+                        )) if path.contains("kpageflags") => {
+                            // Kernels that gate the kpageflags *open*
+                            // itself behind CAP_SYS_ADMIN (EACCES)
+                            // instead of zeroing PFNs: same degradation.
+                            accounting.note_ledger_unusable();
+                            filter_memory_ranges_by_soft_dirty(guest_memory, &full_ranges)?
+                        }
+                        Err(IntersectionError::Anon(e)) => return Err(e.into()),
+                        Err(IntersectionError::SoftDirty(e)) => return Err(e.into()),
+                    };
+                    debug!(
+                        "Soft-dirty delta snapshot: {} ranges, {} of {} pages",
+                        ranges.len(),
+                        stats.dirty_pages,
+                        stats.total_pages
+                    );
+                    if let Err(e) = write_ranges_at_offsets(guest_memory, &mappings, file, &ranges)
+                    {
+                        accounting.disarm();
+                        return Err(MemoryBackingFile("write_all_at", e));
+                    }
+                    // Ack: only now that the window is durably written do we
+                    // open the next one.
+                    if let Err(e) = accounting.ack_persisted() {
+                        accounting.disarm();
+                        return Err(e.into());
+                    }
+                    Ok(())
+                } else {
+                    // First window: write the cumulative anon baseline, then
+                    // arm — the window opens strictly after the baseline, so
+                    // nothing written before arming can escape the ledger.
+                    let (ranges, stats) =
+                        match filter_memory_ranges_by_pagemap_anon(guest_memory, &full_ranges) {
+                            Ok(ok) => ok,
+                            Err(e) => {
+                                accounting.note_ledger_unusable();
+                                return Err(e.into());
+                            }
+                        };
+                    debug!(
+                        "Soft-dirty baseline snapshot: {} anon ranges, {} of {} pages",
+                        ranges.len(),
+                        stats.anon_pages,
+                        stats.total_pages
+                    );
+                    write_ranges_at_offsets(guest_memory, &mappings, file, &ranges)
+                        .map_err(|e| MemoryBackingFile("write_all_at", e))?;
+                    // Baseline persisted; arm for the next snapshot. A probe
+                    // that reports "unsupported" is not an error: this
+                    // baseline file is a valid snapshot, only future requests
+                    // degrade to the anon-only line.
+                    match accounting.arm() {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            accounting.disarm();
+                            Err(e.into())
+                        }
+                    }
+                }
+            }
+            // Handled by the caller's match; unreachable in practice.
+            _ => Err(MemoryBackingFile(
+                "snapshot_memory_incremental",
+                io::Error::new(io::ErrorKind::InvalidInput, "not an incremental type"),
+            )),
+        }
     }
 
     /// Register a device IRQ
@@ -768,19 +942,203 @@ fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
     Ok(bitmap)
 }
 
+/// One entry of the guest-physical-address -> memory-file-offset mapping used
+/// by the incremental snapshot write path. `file_offset` mirrors the
+/// sequential region order of [`crate::vstate::memory::GuestMemoryExtension::dump`],
+/// so a base patched through this table stays byte-compatible with a Full
+/// snapshot file.
+struct RegionFileMapping {
+    /// GPA of the first byte of the region.
+    gpa: u64,
+    /// Region length in bytes.
+    length: u64,
+    /// Offset of the region's first byte in the memory file.
+    file_offset: u64,
+}
+
+/// Builds the GPA -> file-offset table for the given guest memory (regions
+/// in ascending address order, file offsets as consecutive concatenation).
+fn memory_file_mappings(guest_memory: &GuestMemoryMmap) -> Vec<RegionFileMapping> {
+    let mut mappings = Vec::new();
+    let mut offset = 0u64;
+    for region in guest_memory.iter() {
+        let length = region.len();
+        mappings.push(RegionFileMapping {
+            gpa: region.start_addr().0,
+            length,
+            file_offset: offset,
+        });
+        offset += length;
+    }
+    mappings
+}
+
+/// Writes the given guest-physical `ranges` into `file` at their mapped
+/// offsets (`pwrite` semantics: the file cursor is untouched, holes between
+/// ranges keep their previous content). Returns the number of bytes written.
+fn write_ranges_at_offsets(
+    guest_memory: &GuestMemoryMmap,
+    mappings: &[RegionFileMapping],
+    file: &mut File,
+    ranges: &[MemoryRange],
+) -> io::Result<u64> {
+    use std::os::unix::fs::FileExt;
+
+    let mut written = 0u64;
+    for range in ranges {
+        let mut gpa = range.gpa;
+        let mut remaining = range.length;
+        while remaining > 0 {
+            let mapping = mappings
+                .iter()
+                .find(|m| gpa >= m.gpa && gpa < m.gpa + m.length)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("GPA 0x{gpa:x} outside guest memory regions"),
+                    )
+                })?;
+            let chunk = std::cmp::min(remaining, mapping.gpa + mapping.length - gpa);
+
+            let host_addr = guest_memory
+                .get_host_address(GuestAddress(gpa))
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("no host address for GPA 0x{gpa:x}: {e}"),
+                    )
+                })?;
+            // SAFETY: `host_addr` points at the live guest-memory mapping and
+            // `chunk` bytes starting there lie within the region found above.
+            let buf = unsafe {
+                std::slice::from_raw_parts(
+                    host_addr.cast_const(),
+                    usize::try_from(chunk).expect("chunk must fit in usize"),
+                )
+            };
+            file.write_all_at(buf, mapping.file_offset + (gpa - mapping.gpa))?;
+
+            gpa += chunk;
+            remaining -= chunk;
+            written += chunk;
+        }
+    }
+    Ok(written)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::atomic::Ordering;
 
     use vm_memory::GuestAddress;
     use vm_memory::mmap::MmapRegionBuilder;
+    use vm_memory::{Bytes, GuestMemory};
 
     use super::*;
     use crate::pci::PciSBDF;
     use crate::snapshot::Persist;
     use crate::test_utils::single_region_mem_raw;
     use crate::utils::mib_to_bytes;
+    use crate::vmm_config::machine_config::HugePageConfig;
     use crate::vstate::kvm::Kvm;
+    use crate::vstate::memory::test_utils::into_region_ext;
+
+    /// The GPA->file-offset table must mirror the sequential dump order:
+    /// with a gap between regions, the second region's file offset skips
+    /// nothing and the first gets exactly its own length.
+    #[test]
+    fn test_memory_file_mappings_skip_guest_hole() {
+        let page = crate::vstate::pagemap_anon::host_page_size();
+        let page_usize = usize::try_from(page).unwrap();
+        let regions = vec![
+            (GuestAddress(0), 2 * page_usize),
+            (GuestAddress(0x10000 * 16), 3 * page_usize),
+        ];
+        let guest_memory = into_region_ext(
+            crate::vstate::memory::anonymous(regions.into_iter(), false, HugePageConfig::None)
+                .unwrap(),
+        );
+
+        let mappings = memory_file_mappings(&guest_memory);
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(
+            (mappings[0].gpa, mappings[0].length, mappings[0].file_offset),
+            (0, 2 * page, 0)
+        );
+        assert_eq!(
+            (mappings[1].gpa, mappings[1].length, mappings[1].file_offset),
+            (0x10000 * 16, 3 * page, 2 * page)
+        );
+    }
+
+    /// Ranges written through the mapping table must land at the packed
+    /// region offsets, and bytes outside the ranges must stay untouched.
+    #[test]
+    fn test_write_ranges_at_offsets_pwrite_semantics() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let page = crate::vstate::pagemap_anon::host_page_size();
+        let page_usize = usize::try_from(page).unwrap();
+        let region1_len = 2 * page_usize;
+        let region2_gpa = 0x10000 * 16u64;
+        let region2_len = 3 * page_usize;
+        let regions = vec![
+            (GuestAddress(0), region1_len),
+            (GuestAddress(region2_gpa), region2_len),
+        ];
+        let guest_memory = into_region_ext(
+            crate::vstate::memory::anonymous(regions.into_iter(), false, HugePageConfig::None)
+                .unwrap(),
+        );
+        let mappings = memory_file_mappings(&guest_memory);
+
+        // Fill the second guest region with a recognizable pattern.
+        let value_base: u64 = 0xA500_0000;
+        for i in 0..(region2_len / 8) {
+            guest_memory
+                .write_obj(
+                    value_base + i as u64,
+                    GuestAddress(region2_gpa + (i * 8) as u64),
+                )
+                .unwrap();
+        }
+
+        // Write only the second region's middle page into the file.
+        let target = MemoryRange {
+            gpa: region2_gpa + page,
+            length: page,
+        };
+        let mut file = vmm_sys_util::tempfile::TempFile::new().unwrap().into_file();
+        file.set_len(5 * page).unwrap();
+        let written =
+            write_ranges_at_offsets(&guest_memory, &mappings, &mut file, &[target]).unwrap();
+        assert_eq!(written, page);
+
+        // Verify qword-exactly: the target page (region1's 2-page file span
+        // comes first, so region2's middle page lands at file offset 3*page)
+        // carries the guest pattern; every qword outside it is untouched
+        // (zero in the fresh file).
+        let mut content = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut content).unwrap();
+        let qwords = content.len() / 8;
+        for qword_idx in 0..qwords {
+            let got = u64::from_ne_bytes(
+                content[qword_idx * 8..qword_idx * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let byte_off = (qword_idx * 8) as u64;
+            if (3 * page..4 * page).contains(&byte_off) {
+                // Guest qword index: region2 base + one page into it.
+                let guest_idx =
+                    page_usize / 8 + (usize::try_from(byte_off).unwrap() - 3 * page_usize) / 8;
+                assert_eq!(got, value_base + guest_idx as u64);
+            } else {
+                assert_eq!(got, 0, "outside the range the base must be untouched");
+            }
+        }
+    }
     use crate::vstate::memory::GuestRegionMmap;
 
     // Auxiliary function being used throughout the tests.

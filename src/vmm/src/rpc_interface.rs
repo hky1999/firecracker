@@ -952,6 +952,16 @@ impl RuntimeApiController {
                     elapsed_time_us
                 );
             }
+            SnapshotType::Incremental | SnapshotType::SoftDirty => {
+                let elapsed_time_us = update_metric_with_elapsed_time(
+                    &METRICS.latencies_us.vmm_diff_create_snapshot,
+                    create_start_us,
+                );
+                info!(
+                    "'create incremental snapshot' VMM action took {} us.",
+                    elapsed_time_us
+                );
+            }
         }
         Ok(VmmData::Empty)
     }

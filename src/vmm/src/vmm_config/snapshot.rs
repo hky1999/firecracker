@@ -18,6 +18,18 @@ pub enum SnapshotType {
     /// Full snapshot.
     #[default]
     Full,
+    /// Incremental snapshot via the cumulative pagemap-anon ledger: writes
+    /// every CoW anonymous (guest-written) page into the existing base
+    /// memory file. The base must be pre-created by the caller (typically a
+    /// reflink clone of the restore memory file); FC reports an explicit
+    /// error instead of silently writing a wrong file when it is missing.
+    Incremental,
+    /// Incremental snapshot via the soft-dirty (pagemap bit 55) window
+    /// ledger: writes only pages written since the previous successful
+    /// snapshot of this VM. The first snapshot of this type writes the
+    /// cumulative anon baseline and arms the ledger; the base file contract
+    /// is the same as for `Incremental`.
+    SoftDirty,
 }
 
 /// Specifies the method through which guest memory will get populated when
