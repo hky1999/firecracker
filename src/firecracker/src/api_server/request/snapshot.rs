@@ -23,6 +23,13 @@ pub const MISSING_FIELD: &str =
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
 
+/// Handler for `GET /vm/dirty-memory-ranges` (M1-F6): a read-only preview of
+/// the armed incremental window. No metric counter — it is a private
+/// diagnostic endpoint, deliberately not part of the public API surface.
+pub(crate) fn parse_get_dirty_memory_ranges() -> Result<ParsedRequest, RequestError> {
+    Ok(ParsedRequest::new_sync(VmmAction::GetDirtyMemoryRanges))
+}
+
 pub(crate) fn parse_put_snapshot(
     body: &Body,
     request_type_from_path: Option<&str>,

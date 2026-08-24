@@ -30,7 +30,7 @@ use crate::logger::{debug, trace};
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// A guest-physical address range selected for incremental snapshotting.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryRange {
     /// Guest-physical address of the first byte of the range.
     pub gpa: u64,
