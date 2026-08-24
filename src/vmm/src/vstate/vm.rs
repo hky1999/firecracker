@@ -38,6 +38,7 @@ use crate::vstate::memory::{
     GuestRegionMmap, GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
+use crate::vstate::soft_dirty::SoftDirtyAccounting;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 
@@ -80,6 +81,9 @@ pub struct VmCommon {
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
+    /// Lazy-arming incremental-snapshot ledger state (M1-F5). Probed on the
+    /// first incremental snapshot, not on VM creation.
+    pub soft_dirty_accounting: SoftDirtyAccounting,
 }
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -188,6 +192,7 @@ impl KvmVm {
             uffd: None,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
+            soft_dirty_accounting: SoftDirtyAccounting::default(),
         })
     }
 

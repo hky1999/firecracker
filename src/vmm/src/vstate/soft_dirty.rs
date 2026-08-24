@@ -24,6 +24,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 
 use vm_memory::{GuestAddress, GuestMemory};
@@ -118,6 +119,163 @@ pub enum IntersectionError {
     Anon(#[from] pagemap_anon::PagemapAnonError),
     /// soft-dirty ledger failed: {0}
     SoftDirty(#[from] SoftDirtyError),
+}
+
+/// Which ledger incremental accounting currently uses (M1-F5 lazy arming).
+///
+/// The mode starts [`AccountingMode::Unprobed`]: probing the kernel costs a
+/// clear_refs round-trip over every PTE of the process, so it is deferred to
+/// the first snapshot that actually needs a ledger, instead of being paid on
+/// every microVM start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AccountingMode {
+    /// No snapshot has needed a ledger yet; probe on first use.
+    #[default]
+    Unprobed,
+    /// Soft-dirty window ledger (bit 55) is armed and authoritative.
+    SoftDirty,
+    /// Soft-dirty unsupported on this kernel; fall back to the cumulative
+    /// pagemap-anon ledger (only meaningful for MAP_PRIVATE restores).
+    AnonOnly,
+    /// No usable ledger; the caller must take Full snapshots.
+    Disabled,
+}
+
+/// Outcome of an [`SoftDirtyAccounting::arm`] attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmOutcome {
+    /// Probe succeeded and the ledger was armed.
+    Armed,
+    /// The ledger was already armed — nothing was done.
+    AlreadyArmed,
+    /// Soft-dirty is unusable here; accounting degraded to [`AccountingMode::AnonOnly`].
+    AnonOnly,
+}
+
+/// Lazy-arming state machine for the soft-dirty ledger, one per microVM.
+///
+/// Arming is driven exclusively by write success (ack semantics, absorbing
+/// the AgentEnv 环② lesson): `clear_refs(4)` opens the next delta window, so
+/// it must never run unless the *previous* window was durably persisted —
+/// otherwise the pages of a lost window silently vanish from every later
+/// delta. Consequently:
+/// - [`SoftDirtyAccounting::arm`] only fires on the first incremental
+///   snapshot (or after a failure disarmed the ledger);
+/// - [`SoftDirtyAccounting::ack_persisted`] re-arms after a successful write;
+/// - [`SoftDirtyAccounting::disarm`] marks a failed window so the next
+///   snapshot re-arms (which re-baselines by writing the full anon set).
+#[derive(Debug)]
+pub struct SoftDirtyAccounting {
+    mode: std::sync::Mutex<AccountingMode>,
+    armed: AtomicBool,
+}
+
+impl Default for SoftDirtyAccounting {
+    fn default() -> Self {
+        Self {
+            mode: std::sync::Mutex::new(AccountingMode::Unprobed),
+            armed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl SoftDirtyAccounting {
+    /// Current accounting mode.
+    pub fn mode(&self) -> AccountingMode {
+        *self.mode.lock().unwrap()
+    }
+
+    /// Whether the soft-dirty ledger is armed (window open).
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Probe the kernel and arm the ledger if possible.
+    ///
+    /// Degradation is explicit, never silent: an unusable soft-dirty
+    /// interface switches the mode to [`AccountingMode::AnonOnly`] and
+    /// returns [`ArmOutcome::AnonOnly`] so the caller knows to write the
+    /// cumulative anon set instead of a window delta.
+    pub fn arm(&self) -> Result<ArmOutcome> {
+        self.arm_with_probe(probe_soft_dirty_support)
+    }
+
+    /// Testable core of [`Self::arm`] with an injected probe (arming write
+    /// still goes through the real [`clear_soft_dirty`]).
+    fn arm_with_probe(&self, probe: impl FnOnce() -> Result<bool>) -> Result<ArmOutcome> {
+        self.arm_with(probe, clear_soft_dirty)
+    }
+
+    /// Fully injectable core: `probe` reports kernel support, `arm_write`
+    /// performs the arming clear_refs write.
+    fn arm_with(
+        &self,
+        probe: impl FnOnce() -> Result<bool>,
+        arm_write: impl FnOnce() -> Result<()>,
+    ) -> Result<ArmOutcome> {
+        let mut mode = self.mode.lock().unwrap();
+
+        match *mode {
+            AccountingMode::SoftDirty if self.is_armed() => return Ok(ArmOutcome::AlreadyArmed),
+            _ => {}
+        }
+
+        match probe() {
+            Ok(true) => {
+                // Propagate an arming failure: the caller must treat this
+                // snapshot as failed; the mode stays untouched so the next
+                // attempt re-probes.
+                arm_write()?;
+                *mode = AccountingMode::SoftDirty;
+                self.armed.store(true, std::sync::atomic::Ordering::Release);
+                Ok(ArmOutcome::Armed)
+            }
+            Ok(false) | Err(_) => {
+                // Kernel without usable soft-dirty tracking (probe Err covers
+                // locked-down /proc paths that would mislead an is_ok check).
+                *mode = AccountingMode::AnonOnly;
+                self.armed
+                    .store(false, std::sync::atomic::Ordering::Release);
+                Ok(ArmOutcome::AnonOnly)
+            }
+        }
+    }
+
+    /// Re-arm after the current delta window was durably written (ack).
+    ///
+    /// Errors (and disarms) if re-arming fails: the next snapshot will then
+    /// re-arm via [`Self::arm`], whose arming writes a fresh full window.
+    pub fn ack_persisted(&self) -> Result<()> {
+        let mode = *self.mode.lock().unwrap();
+        if mode != AccountingMode::SoftDirty {
+            return Ok(());
+        }
+        if let Err(e) = clear_soft_dirty() {
+            self.armed
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Err(e);
+        }
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Mark the current window as *not* persisted: disarm so the next
+    /// snapshot re-arms and re-baselines instead of trusting a ledger whose
+    /// window start was lost.
+    pub fn disarm(&self) {
+        self.armed
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Demote [`AccountingMode::AnonOnly`] to [`AccountingMode::Disabled`]
+    /// after the anon ledger itself failed (e.g. kpageflags needs
+    /// CAP_SYS_ADMIN); the caller must fall back to Full snapshots.
+    pub fn note_ledger_unusable(&self) {
+        let mut mode = self.mode.lock().unwrap();
+        if *mode == AccountingMode::AnonOnly {
+            *mode = AccountingMode::Disabled;
+        }
+    }
 }
 
 /// Statistics about soft-dirty filtering results
@@ -485,6 +643,84 @@ mod tests {
     fn test_soft_dirty_constants() {
         assert_eq!(PAGEMAP_SOFT_DIRTY_BIT, 1u64 << 55);
         assert_eq!(CLEAR_REFS_SOFT_DIRTY, b"4\n");
+    }
+
+    /// F5 state machine: happy path probes once, arms, and `arm` again is a
+    /// no-op until a failed write disarms.
+    #[test]
+    fn test_accounting_arm_ack_disarm_cycle() {
+        let acc = SoftDirtyAccounting::default();
+        assert_eq!(acc.mode(), AccountingMode::Unprobed);
+        assert!(!acc.is_armed());
+
+        assert_eq!(
+            acc.arm_with(|| Ok(true), || Ok(())).unwrap(),
+            ArmOutcome::Armed
+        );
+        assert_eq!(acc.mode(), AccountingMode::SoftDirty);
+        assert!(acc.is_armed());
+
+        // Armed ledger: no re-probe, no clear_refs reset of the open window.
+        assert_eq!(
+            acc.arm_with(|| panic!("must not re-probe while armed"), || Ok(()))
+                .unwrap(),
+            ArmOutcome::AlreadyArmed
+        );
+
+        // Ack after a durable write re-arms (window rolls over).
+        acc.ack_persisted().unwrap();
+        assert!(acc.is_armed());
+
+        // Write failure: disarm, next arm re-probes and re-arms.
+        acc.disarm();
+        assert!(!acc.is_armed());
+        assert_eq!(
+            acc.arm_with(|| Ok(true), || Ok(())).unwrap(),
+            ArmOutcome::Armed
+        );
+    }
+
+    /// F5 degradation matrix: unsupported kernel (Ok(false)) and locked-down
+    /// /proc (Err) both land in AnonOnly; a failing anon ledger then demotes
+    /// to Disabled.
+    #[test]
+    fn test_accounting_degradation_matrix() {
+        for probe_result in [Ok(false), Err(SoftDirtyError::NotPageAligned)] {
+            let acc = SoftDirtyAccounting::default();
+            assert_eq!(
+                acc.arm_with(move || probe_result, || Ok(())).unwrap(),
+                ArmOutcome::AnonOnly
+            );
+            assert_eq!(acc.mode(), AccountingMode::AnonOnly);
+            assert!(!acc.is_armed());
+
+            // Ack in AnonOnly mode must stay a no-op: there is no window
+            // ledger to roll over.
+            acc.ack_persisted().unwrap();
+
+            // The anon ledger failing too (e.g. kpageflags EACCES) is final.
+            acc.note_ledger_unusable();
+            assert_eq!(acc.mode(), AccountingMode::Disabled);
+
+            // Demotion is one-way: a later successful probe must not
+            // resurrect a Disabled accountant (caller owns Full fallback).
+            acc.note_ledger_unusable();
+            assert_eq!(acc.mode(), AccountingMode::Disabled);
+        }
+    }
+
+    /// A failed clear_refs during arming must surface the error and leave the
+    /// mode unclaimed (neither SoftDirty nor silently degraded).
+    #[test]
+    fn test_accounting_arm_clear_failure_degrades() {
+        let acc = SoftDirtyAccounting::default();
+        // Probe succeeds but the subsequent arming write fails: the caller
+        // treats the snapshot as failed...
+        acc.arm_with(|| Ok(true), || Err(SoftDirtyError::NotPageAligned))
+            .unwrap_err();
+        // ...and the mode must not claim SoftDirty.
+        assert_ne!(acc.mode(), AccountingMode::SoftDirty);
+        assert!(!acc.is_armed());
     }
 
     #[test]
