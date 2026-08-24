@@ -55,8 +55,10 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory.
-    pub mem_file_path: PathBuf,
+    /// Path to the file that will contain the guest memory. When omitted,
+    /// only the microVM state is saved (state-only snapshot) and memory
+    /// dumping is fully delegated to the caller.
+    pub mem_file_path: Option<PathBuf>,
 }
 
 /// Allows for changing the mapping between tap devices and host devices

@@ -146,7 +146,7 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
+            mem_file_path: Some(PathBuf::from("bar")),
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -160,7 +160,7 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
+            mem_file_path: Some(PathBuf::from("bar")),
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -172,6 +172,21 @@ mod tests {
             "mem_file_path": "bar"
         }"#;
         parse_put_snapshot(&Body::new(invalid_body), Some("create")).unwrap_err();
+
+        // State-only snapshot: no `mem_file_path`, memory dumping is
+        // delegated to the caller.
+        let body = r#"{
+            "snapshot_path": "foo"
+        }"#;
+        let expected_config = CreateSnapshotParams {
+            snapshot_type: SnapshotType::Full,
+            snapshot_path: PathBuf::from("foo"),
+            mem_file_path: None,
+        };
+        assert_eq!(
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+            VmmAction::CreateSnapshot(expected_config)
+        );
 
         let body = r#"{
             "snapshot_path": "foo",
