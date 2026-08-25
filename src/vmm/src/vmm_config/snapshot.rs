@@ -59,6 +59,13 @@ pub struct CreateSnapshotParams {
     /// only the microVM state is saved (state-only snapshot) and memory
     /// dumping is fully delegated to the caller.
     pub mem_file_path: Option<PathBuf>,
+    /// When true, skip the fsync (`sync_all`) of the state and memory files;
+    /// the caller takes over durability (e.g. an orchestrator that fsyncs the
+    /// files before committing a manifest). The default (false) preserves the
+    /// upstream contract that a successful create request left the files
+    /// durably written.
+    #[serde(default)]
+    pub deferred_sync: bool,
 }
 
 /// Allows for changing the mapping between tap devices and host devices

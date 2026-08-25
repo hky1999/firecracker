@@ -1668,6 +1668,15 @@ definitions:
           guest-written pages into the existing memory file (which must be
           pre-created by the caller with the full guest memory size);
           SoftDirty tracks the delta since the previous snapshot.
+      deferred_sync:
+        type: boolean
+        default: false
+        description:
+          When true, Firecracker skips the fsync of the state and memory
+          files and the caller takes over durability (e.g. an orchestrator
+          that fsyncs the files before committing a manifest). When false
+          (default), a successful create request leaves the files durably
+          written.
 
   NetworkOverride:
     type: object
