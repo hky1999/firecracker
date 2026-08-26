@@ -762,6 +762,43 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /vm/dirty-memory-ranges:
+    get:
+      summary: (AKernel extension, M1-F6) Read-only preview of the armed incremental dirty window.
+      description: >
+        Returns the guest-physical ranges the next incremental snapshot would
+        write, with the ledgers' state flags. Read-only: no ledger state
+        transitions. The KVM dirty log is not exposed because reading it
+        fetch-clears the bitmap. Diagnostic cross-validation aid only.
+      operationId: getDirtyMemoryRanges
+      responses:
+        200:
+          description: Dirty window preview
+          schema:
+            type: object
+            properties:
+              armed:
+                type: boolean
+              anon_usable:
+                type: boolean
+              dirty_pages:
+                type: integer
+              total_pages:
+                type: integer
+              ranges:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    gpa:
+                      type: integer
+                    length:
+                      type: integer
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /snapshot/create:
     put:
       summary: Creates a full or diff snapshot. Post-boot only.
@@ -1607,12 +1644,14 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
       - snapshot_path
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description:
+          Path to the file that will contain the guest memory. When
+          omitted, only the microVM state is saved (state-only snapshot)
+          and memory dumping is delegated to the caller.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.

@@ -65,6 +65,10 @@ pub enum VmmAction {
     /// Create a snapshot using as input the `CreateSnapshotParams`. This action can only be called
     /// after the microVM has booted and only when the microVM is in `Paused` state.
     CreateSnapshot(CreateSnapshotParams),
+    /// Read-only preview of the armed incremental dirty window (M1-F6).
+    /// Cross-validation aid for external pagemap readers; never a sole
+    /// accounting source, and it transitions no ledger state.
+    GetDirtyMemoryRanges,
     /// Get the balloon device configuration.
     GetBalloonConfig,
     /// Get the ballon device latest statistics.
@@ -229,6 +233,8 @@ pub enum VmmData {
     BalloonConfig(BalloonDeviceConfig),
     /// The latest balloon device statistics.
     BalloonStats(BalloonStats),
+    /// The read-only dirty-window preview (M1-F6).
+    DirtyMemoryRanges(crate::vstate::vm::DirtyMemoryRanges),
     /// No data is sent on the channel.
     Empty,
     /// The complete microVM configuration in JSON format.
@@ -501,6 +507,7 @@ impl<'a> PrebootApiController<'a> {
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
+            | GetDirtyMemoryRanges
             | FlushMetrics
             | Pause
             | Resume
@@ -703,6 +710,7 @@ impl RuntimeApiController {
         match request {
             // Supported operations allowed post-boot.
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
+            GetDirtyMemoryRanges => self.get_dirty_memory_ranges(),
             FlushMetrics => self.flush_metrics(),
             GetBalloonConfig => self
                 .vmm
@@ -915,6 +923,17 @@ impl RuntimeApiController {
             .send_ctrl_alt_del()
             .map(|()| VmmData::Empty)
             .map_err(VmmActionError::InternalVmm)
+    }
+
+    fn get_dirty_memory_ranges(&mut self) -> Result<VmmData, VmmActionError> {
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+        let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+            VmmActionError::InternalVmm(VmmError::NotSupportedOnVmType(vmm.vm.type_name()))
+        })?;
+        kvm_vm
+            .dirty_memory_ranges()
+            .map(VmmData::DirtyMemoryRanges)
+            .map_err(VmmActionError::CreateSnapshot)
     }
 
     fn create_snapshot(
@@ -1249,7 +1268,7 @@ mod tests {
             CreateSnapshotParams {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+                mem_file_path: Some(PathBuf::new()),
             },
         )));
         #[cfg(target_arch = "x86_64")]

@@ -23,6 +23,13 @@ pub const MISSING_FIELD: &str =
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
 
+/// Handler for `GET /vm/dirty-memory-ranges` (M1-F6): a read-only preview of
+/// the armed incremental window. No metric counter — it is a private
+/// diagnostic endpoint, deliberately not part of the public API surface.
+pub(crate) fn parse_get_dirty_memory_ranges() -> Result<ParsedRequest, RequestError> {
+    Ok(ParsedRequest::new_sync(VmmAction::GetDirtyMemoryRanges))
+}
+
 pub(crate) fn parse_put_snapshot(
     body: &Body,
     request_type_from_path: Option<&str>,
@@ -146,7 +153,7 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
+            mem_file_path: Some(PathBuf::from("bar")),
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -160,7 +167,7 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
+            mem_file_path: Some(PathBuf::from("bar")),
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -172,6 +179,21 @@ mod tests {
             "mem_file_path": "bar"
         }"#;
         parse_put_snapshot(&Body::new(invalid_body), Some("create")).unwrap_err();
+
+        // State-only snapshot: no `mem_file_path`, memory dumping is
+        // delegated to the caller.
+        let body = r#"{
+            "snapshot_path": "foo"
+        }"#;
+        let expected_config = CreateSnapshotParams {
+            snapshot_type: SnapshotType::Full,
+            snapshot_path: PathBuf::from("foo"),
+            mem_file_path: None,
+        };
+        assert_eq!(
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+            VmmAction::CreateSnapshot(expected_config)
+        );
 
         let body = r#"{
             "snapshot_path": "foo",

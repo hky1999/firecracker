@@ -701,6 +701,7 @@ impl KvmVm {
 
         match snapshot_type {
             SnapshotType::Incremental => {
+                let t_ledger = std::time::Instant::now();
                 let (ranges, stats) =
                     match filter_memory_ranges_by_pagemap_anon(guest_memory, &full_ranges) {
                         Ok(ok) => ok,
@@ -710,6 +711,7 @@ impl KvmVm {
                             return Err(e.into());
                         }
                     };
+                let t_write = std::time::Instant::now();
                 debug!(
                     "Incremental snapshot: {} anon ranges, {} of {} pages",
                     ranges.len(),
@@ -718,6 +720,13 @@ impl KvmVm {
                 );
                 write_ranges_at_offsets(guest_memory, &mappings, file, &ranges)
                     .map_err(|e| MemoryBackingFile("write_all_at", e))?;
+                info!(
+                    "Incremental snapshot phases: ledger={}ms write={}ms",
+                    t_write.duration_since(t_ledger).as_millis(),
+                    std::time::Instant::now()
+                        .duration_since(t_write)
+                        .as_millis(),
+                );
                 Ok(())
             }
             SnapshotType::SoftDirty => {
@@ -727,6 +736,7 @@ impl KvmVm {
                     // unusable (kpageflags needs CAP_SYS_ADMIN), degrade to
                     // the plain soft-dirty window: a superset of the minimal
                     // delta, never a subset.
+                    let t_ledger = std::time::Instant::now();
                     let (ranges, stats) = match filter_memory_ranges_by_anon_and_soft_dirty(
                         guest_memory,
                         &full_ranges,
@@ -750,6 +760,7 @@ impl KvmVm {
                         Err(IntersectionError::Anon(e)) => return Err(e.into()),
                         Err(IntersectionError::SoftDirty(e)) => return Err(e.into()),
                     };
+                    let t_write = std::time::Instant::now();
                     debug!(
                         "Soft-dirty delta snapshot: {} ranges, {} of {} pages",
                         ranges.len(),
@@ -761,17 +772,25 @@ impl KvmVm {
                         accounting.disarm();
                         return Err(MemoryBackingFile("write_all_at", e));
                     }
+                    let t_arm = std::time::Instant::now();
                     // Ack: only now that the window is durably written do we
                     // open the next one.
                     if let Err(e) = accounting.ack_persisted() {
                         accounting.disarm();
                         return Err(e.into());
                     }
+                    info!(
+                        "Soft-dirty delta snapshot phases: ledger={}ms write={}ms rearm={}ms",
+                        t_write.duration_since(t_ledger).as_millis(),
+                        t_arm.duration_since(t_write).as_millis(),
+                        std::time::Instant::now().duration_since(t_arm).as_millis(),
+                    );
                     Ok(())
                 } else {
                     // First window: write the cumulative anon baseline, then
                     // arm — the window opens strictly after the baseline, so
                     // nothing written before arming can escape the ledger.
+                    let t_ledger = std::time::Instant::now();
                     let (ranges, stats) =
                         match filter_memory_ranges_by_pagemap_anon(guest_memory, &full_ranges) {
                             Ok(ok) => ok,
@@ -780,6 +799,7 @@ impl KvmVm {
                                 return Err(e.into());
                             }
                         };
+                    let t_write = std::time::Instant::now();
                     debug!(
                         "Soft-dirty baseline snapshot: {} anon ranges, {} of {} pages",
                         ranges.len(),
@@ -788,11 +808,19 @@ impl KvmVm {
                     );
                     write_ranges_at_offsets(guest_memory, &mappings, file, &ranges)
                         .map_err(|e| MemoryBackingFile("write_all_at", e))?;
+                    let t_arm = std::time::Instant::now();
                     // Baseline persisted; arm for the next snapshot. A probe
                     // that reports "unsupported" is not an error: this
                     // baseline file is a valid snapshot, only future requests
                     // degrade to the anon-only line.
-                    match accounting.arm() {
+                    let armed = accounting.arm();
+                    info!(
+                        "Soft-dirty baseline snapshot phases: ledger={}ms write={}ms arm={}ms",
+                        t_write.duration_since(t_ledger).as_millis(),
+                        t_arm.duration_since(t_write).as_millis(),
+                        std::time::Instant::now().duration_since(t_arm).as_millis(),
+                    );
+                    match armed {
                         Ok(_) => Ok(()),
                         Err(e) => {
                             accounting.disarm();
@@ -806,6 +834,65 @@ impl KvmVm {
                 "snapshot_memory_incremental",
                 io::Error::new(io::ErrorKind::InvalidInput, "not an incremental type"),
             )),
+        }
+    }
+
+    /// Read-only preview of the pages the next incremental snapshot would
+    /// write (M1-F6). Both ledgers are consulted without any state
+    /// transition: the soft-dirty bit is only cleared when a snapshot acks
+    /// its window, so calling this between snapshots is invisible to them.
+    /// The KVM dirty log is deliberately NOT exposed here — reading it
+    /// fetch-clears the bitmap and would eat the next snapshot's window.
+    /// This exists to cross-validate external pagemap readers and must
+    /// never become the sole accounting source.
+    pub(crate) fn dirty_memory_ranges(&self) -> Result<DirtyMemoryRanges, CreateSnapshotError> {
+        let guest_memory = self.guest_memory();
+        let accounting = &self.common.soft_dirty_accounting;
+        let full_ranges: Vec<MemoryRange> = guest_memory
+            .iter()
+            .map(|region| MemoryRange {
+                gpa: region.start_addr().0,
+                length: region.len(),
+            })
+            .collect();
+        let total_pages = || -> u64 {
+            full_ranges
+                .iter()
+                .map(|r| r.length.div_ceil(pagemap_anon::host_page_size()))
+                .sum()
+        };
+        if !accounting.is_armed() {
+            // No window is open yet: the next incremental snapshot would
+            // write the full anon baseline first. Nothing to preview.
+            return Ok(DirtyMemoryRanges {
+                armed: false,
+                anon_usable: true,
+                dirty_pages: 0,
+                total_pages: total_pages(),
+                ranges: Vec::new(),
+            });
+        }
+        // Mirror the armed SoftDirty snapshot selection, degrade included,
+        // but without touching the accounting state machine.
+        match filter_memory_ranges_by_anon_and_soft_dirty(guest_memory, &full_ranges) {
+            Ok((ranges, stats)) => Ok(DirtyMemoryRanges {
+                armed: true,
+                anon_usable: true,
+                dirty_pages: stats.dirty_pages,
+                total_pages: stats.total_pages,
+                ranges,
+            }),
+            Err(IntersectionError::Anon(pagemap_anon::PagemapAnonError::NoCapSysAdmin)) => {
+                degraded_soft_dirty_window(guest_memory, &full_ranges)
+            }
+            Err(IntersectionError::Anon(pagemap_anon::PagemapAnonError::OpenFailed {
+                path,
+                ..
+            })) if path.contains("kpageflags") => {
+                degraded_soft_dirty_window(guest_memory, &full_ranges)
+            }
+            Err(IntersectionError::Anon(e)) => Err(e.into()),
+            Err(IntersectionError::SoftDirty(e)) => Err(e.into()),
         }
     }
 
@@ -958,6 +1045,41 @@ struct RegionFileMapping {
 
 /// Builds the GPA -> file-offset table for the given guest memory (regions
 /// in ascending address order, file offsets as consecutive concatenation).
+/// Read-only preview of an armed incremental window (M1-F6): the ranges the
+/// next snapshot would write, with the ledgers' state flags. See
+/// [`Vm::dirty_memory_ranges`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirtyMemoryRanges {
+    /// Whether the soft-dirty window is armed. False means the next
+    /// incremental snapshot would write the full anon baseline first.
+    pub armed: bool,
+    /// Whether the anon ledger (kpageflags) participated, or the preview
+    /// degraded to the plain soft-dirty window like a snapshot would.
+    pub anon_usable: bool,
+    /// Dirty pages in the current window.
+    pub dirty_pages: u64,
+    /// Total pages across all guest memory regions.
+    pub total_pages: u64,
+    /// Guest-physical ranges the next snapshot would write.
+    pub ranges: Vec<MemoryRange>,
+}
+
+/// Degraded armed-window preview: the plain soft-dirty window, a superset of
+/// the minimal delta (same semantics as the snapshot's degrade path).
+fn degraded_soft_dirty_window(
+    guest_memory: &GuestMemoryMmap,
+    full_ranges: &[MemoryRange],
+) -> Result<DirtyMemoryRanges, CreateSnapshotError> {
+    let (ranges, stats) = filter_memory_ranges_by_soft_dirty(guest_memory, full_ranges)?;
+    Ok(DirtyMemoryRanges {
+        armed: true,
+        anon_usable: false,
+        dirty_pages: stats.dirty_pages,
+        total_pages: stats.total_pages,
+        ranges,
+    })
+}
+
 fn memory_file_mappings(guest_memory: &GuestMemoryMmap) -> Vec<RegionFileMapping> {
     let mut mappings = Vec::new();
     let mut offset = 0u64;
