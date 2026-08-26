@@ -1621,9 +1621,14 @@ definitions:
         enum:
           - Full
           - Diff
+          - Incremental
+          - SoftDirty
         description:
           Type of snapshot to create. It is optional and by default, a full
-          snapshot is created.
+          snapshot is created. Incremental and SoftDirty write only the
+          guest-written pages into the existing memory file (which must be
+          pre-created by the caller with the full guest memory size);
+          SoftDirty tracks the delta since the previous snapshot.
 
   NetworkOverride:
     type: object

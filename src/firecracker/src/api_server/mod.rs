@@ -159,6 +159,12 @@ impl ApiServer {
                     &METRICS.latencies_us.diff_create_snapshot,
                     "create diff snapshot",
                 )),
+                // The incremental flavors are counted under the diff metric:
+                // they serve the same purpose (delta snapshotting).
+                SnapshotType::Incremental | SnapshotType::SoftDirty => Some((
+                    &METRICS.latencies_us.diff_create_snapshot,
+                    "create incremental snapshot",
+                )),
             },
             VmmAction::LoadSnapshot(_) => {
                 Some((&METRICS.latencies_us.load_snapshot, "load snapshot"))

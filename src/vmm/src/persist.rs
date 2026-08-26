@@ -157,6 +157,21 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Incremental snapshot requires a pre-existing base memory file: {0}
+    BaseMemoryFileMissing(std::path::PathBuf),
+    /// Base memory file {path} has size {actual}, expected {expected}
+    BaseMemoryFileSizeMismatch {
+        /// Path of the offending base file.
+        path: std::path::PathBuf,
+        /// Actual file size in bytes.
+        actual: u64,
+        /// Full guest memory size in bytes.
+        expected: u64,
+    },
+    /// pagemap-anon ledger error: {0}
+    PagemapAnon(#[from] crate::vstate::pagemap_anon::PagemapAnonError),
+    /// soft-dirty ledger error: {0}
+    SoftDirty(#[from] crate::vstate::soft_dirty::SoftDirtyError),
 }
 
 /// Snapshot version
