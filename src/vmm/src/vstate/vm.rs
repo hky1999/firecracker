@@ -581,6 +581,7 @@ impl KvmVm {
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
+        defer_sync: bool,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -664,6 +665,11 @@ impl KvmVm {
 
         file.flush()
             .map_err(|err| MemoryBackingFile("flush", err))?;
+        if defer_sync {
+            // Durability is delegated to the caller (e.g. an orchestrator
+            // that fsyncs the file before committing a manifest).
+            return Ok(());
+        }
         file.sync_all()
             .map_err(|err| MemoryBackingFile("sync_all", err))
     }
@@ -678,9 +684,13 @@ impl KvmVm {
     /// the chosen ledger reports as guest-written.
     ///
     /// Arming stays ack-driven: the soft-dirty window is (re)opened only
-    /// after the delta is durably written, and a failed write disarms so the
-    /// next snapshot rewrites the full anon baseline instead of trusting a
-    /// window whose start was lost.
+    /// after the delta is written (page cache), and a failed write disarms so
+    /// the next snapshot rewrites the full anon baseline instead of trusting
+    /// a window whose start was lost. Durability is a separate concern: the
+    /// in-process fsync when `defer_sync` is false, or the caller's own
+    /// fsync/manifest commit when true — either way arming precedes durable
+    /// storage, which is sound because the caller discards artifacts it
+    /// never committed.
     fn snapshot_memory_incremental(
         &self,
         file: &mut File,
@@ -773,8 +783,27 @@ impl KvmVm {
                         return Err(MemoryBackingFile("write_all_at", e));
                     }
                     let t_arm = std::time::Instant::now();
-                    // Ack: only now that the window is durably written do we
-                    // open the next one.
+                    // Ack (re-arm): the delta write completed (page cache),
+                    // so this call returns success and the caller proceeds to
+                    // its own durability step. Durability is either the
+                    // in-process fsync (`defer_sync=false`) or the caller's
+                    // fsync before committing its manifest.
+                    //
+                    // IMPORTANT — the discard-recovery contract: if the caller
+                    // subsequently FAILS its fsync or manifest commit, it must
+                    // NOT reuse the previous incremental base for the next
+                    // checkpoint. The re-armed window started at the ack
+                    // above, so the previous base no longer describes the
+                    // full guest state — pages dirtied between the previous
+                    // base and this discarded generation are in neither the
+                    // old base nor the new window. The caller's recovery is
+                    // to clear its lineage tracking (sandboxd calls
+                    // `clearBaseMemory`) and force the next checkpoint to a
+                    // SoftDirty FIRST WINDOW, which writes the complete anon
+                    // baseline and re-derives the full state from scratch.
+                    // The first-window path is correct regardless of the
+                    // ledger's armed state because it does not diff against
+                    // any base.
                     if let Err(e) = accounting.ack_persisted() {
                         accounting.disarm();
                         return Err(e.into());
@@ -809,7 +838,8 @@ impl KvmVm {
                     write_ranges_at_offsets(guest_memory, &mappings, file, &ranges)
                         .map_err(|e| MemoryBackingFile("write_all_at", e))?;
                     let t_arm = std::time::Instant::now();
-                    // Baseline persisted; arm for the next snapshot. A probe
+                    // Baseline written; arm for the next snapshot (durability
+                    // follows the same defer_sync contract as above). A probe
                     // that reports "unsupported" is not an error: this
                     // baseline file is a valid snapshot, only future requests
                     // degrade to the anon-only line.

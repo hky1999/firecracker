@@ -1269,6 +1269,7 @@ mod tests {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
                 mem_file_path: Some(PathBuf::new()),
+                deferred_sync: false,
             },
         )));
         #[cfg(target_arch = "x86_64")]

@@ -187,7 +187,7 @@ pub fn create_snapshot(
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
 
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
+    snapshot_state_to_file(&microvm_state, &params.snapshot_path, params.deferred_sync)?;
 
     // State-only snapshot when `mem_file_path` is absent: memory dumping is
     // fully delegated to the caller.
@@ -197,7 +197,11 @@ pub fn create_snapshot(
                 "snapshot requires KVM".into(),
             ))
         })?;
-        kvm_vm.snapshot_memory_to_file(mem_file_path, params.snapshot_type)?;
+        kvm_vm.snapshot_memory_to_file(
+            mem_file_path,
+            params.snapshot_type,
+            params.deferred_sync,
+        )?;
         Some(kvm_vm)
     } else {
         None
@@ -217,6 +221,7 @@ pub fn create_snapshot(
 fn snapshot_state_to_file(
     microvm_state: &MicrovmState,
     snapshot_path: &Path,
+    defer_sync: bool,
 ) -> Result<(), CreateSnapshotError> {
     use self::CreateSnapshotError::*;
     let mut snapshot_file = OpenOptions::new()
@@ -231,6 +236,11 @@ fn snapshot_state_to_file(
     snapshot_file
         .flush()
         .map_err(|err| SnapshotBackingFile("flush", err))?;
+    if defer_sync {
+        // Durability is delegated to the caller (e.g. an orchestrator that
+        // fsyncs the file before committing a manifest).
+        return Ok(());
+    }
     snapshot_file
         .sync_all()
         .map_err(|err| SnapshotBackingFile("sync_all", err))

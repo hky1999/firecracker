@@ -1,4 +1,4 @@
-// Copyright © 2026 Tencent Corporation
+// Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -35,6 +35,8 @@ use crate::vstate::pagemap_anon::{self, MemoryRange};
 
 /// Bit 55 of a pagemap entry: soft-dirty flag
 pub const PAGEMAP_SOFT_DIRTY_BIT: u64 = 1 << 55;
+/// Bit 62: page is swapped out (not present in RAM).
+const PAGEMAP_SWAPPED_BIT: u64 = 1 << 62;
 
 /// Value written to /proc/self/clear_refs to clear soft-dirty bits:
 /// "4" = clear soft-dirty bits only
@@ -351,11 +353,14 @@ pub fn get_soft_dirty_pages(host_addr: u64, length: u64) -> Result<Vec<bool>> {
                 .unwrap(),
         );
 
-        // The soft-dirty bit is readable without privileges; a swapped-out
-        // page (bit 62) is never present, but anonymous swapped pages were
-        // necessarily written, so the anon filter (see the intersection
-        // filter below) classifies them.
-        *item = (entry & PAGEMAP_SOFT_DIRTY_BIT) != 0;
+        // The soft-dirty bit is readable without privileges, but it is only
+        // meaningful for present pages. A swapped-out anonymous page (bit 62)
+        // was necessarily written (it entered swap through a write), yet its
+        // soft-dirty bit is unobservable — the intersection filter would
+        // drop it. Report swapped pages as dirty so the anon ∩ dirty
+        // intersection conservatively includes them.
+        let swapped = (entry & PAGEMAP_SWAPPED_BIT) != 0;
+        *item = swapped || (entry & PAGEMAP_SOFT_DIRTY_BIT) != 0;
     }
 
     Ok(result)
