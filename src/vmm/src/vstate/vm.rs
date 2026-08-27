@@ -730,12 +730,30 @@ impl KvmVm {
                 );
                 write_ranges_at_offsets(guest_memory, &mappings, file, &ranges)
                     .map_err(|e| MemoryBackingFile("write_all_at", e))?;
+                // Baseline written; arm for the next snapshot, exactly like
+                // the SoftDirty first window below. Both modes write the same
+                // cumulative pagemap-anon set; without arming here, the next
+                // SoftDirty request would take the first-window path and
+                // rewrite this whole baseline again. The snapshot runs inside
+                // the caller's pause window, so no guest write can land
+                // between the write and the arm; arming while already armed
+                // is a no-op (no clear_refs rewrite), and an arm failure
+                // disarms and fails the request under the same
+                // discard-recovery contract as the first window — the caller
+                // treats the lineage as lost and rebaselines with Full.
+                let t_arm = std::time::Instant::now();
+                match accounting.arm() {
+                    Ok(_) => {}
+                    Err(e) => {
+                        accounting.disarm();
+                        return Err(e.into());
+                    }
+                }
                 info!(
-                    "Incremental snapshot phases: ledger={}ms write={}ms",
+                    "Incremental snapshot phases: ledger={}ms write={}ms arm={}ms",
                     t_write.duration_since(t_ledger).as_millis(),
-                    std::time::Instant::now()
-                        .duration_since(t_write)
-                        .as_millis(),
+                    t_arm.duration_since(t_write).as_millis(),
+                    std::time::Instant::now().duration_since(t_arm).as_millis(),
                 );
                 Ok(())
             }
