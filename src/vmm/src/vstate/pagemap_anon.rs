@@ -203,7 +203,11 @@ impl PagemapAnonStats {
 /// # Returns
 /// A vector of bools where each bool indicates if the corresponding page
 /// is an anonymous page (CoW written by Guest).
-pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<Vec<bool>> {
+/// Returns one bool per host page (true = anonymous: written while
+/// MAP_PRIVATE, or swapped out) plus the number of swapped-out anonymous
+/// pages seen while scanning; those pages are `true` in the bitmap and
+/// counted separately for the stats logging.
+pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<(Vec<bool>, u64)> {
     let page_size = host_page_size();
     if !host_addr.is_multiple_of(page_size) {
         return Err(PagemapAnonError::NotPageAligned);
@@ -245,6 +249,7 @@ pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<Vec<bool>> {
         })?;
 
     let mut result = vec![false; num_pages];
+    let mut swapped_pages = 0u64;
     let mut kpageflags_buf = [0u8; KPAGEFLAGS_ENTRY_SIZE];
 
     for (i, item) in result.iter_mut().enumerate().take(num_pages) {
@@ -263,6 +268,7 @@ pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<Vec<bool>> {
         // swapped=1.
         if swapped {
             *item = true;
+            swapped_pages += 1;
             continue;
         }
 
@@ -302,7 +308,7 @@ pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<Vec<bool>> {
         }
     }
 
-    Ok(result)
+    Ok((result, swapped_pages))
 }
 
 /// Filter memory ranges by pagemap_anon, returning only ranges with anonymous
@@ -347,7 +353,8 @@ pub fn filter_memory_ranges_by_pagemap_anon(
             .map_err(|_| PagemapAnonError::GetHostAddressFailed)?;
 
         // Get anonymous page bitmap via pagemap + kpageflags
-        let anon_pages = get_anon_pages(host_addr as u64, length)?;
+        let (anon_pages, swapped) = get_anon_pages(host_addr as u64, length)?;
+        stats.swapped_pages += swapped;
 
         // Convert bitmap to memory ranges (merge consecutive anonymous pages)
         let (region_ranges, anon_count) = coalesce_pages_to_ranges(gpa, &anon_pages, page_size);
@@ -412,7 +419,7 @@ mod tests {
         // An address one byte past a page boundary must never be page-aligned,
         // regardless of whether the host uses 4 KiB or 64 KiB pages.
         let unaligned = host_page_size() + 1;
-        let result = get_anon_pages(unaligned, host_page_size());
+        let result = get_anon_pages(unaligned, host_page_size()).map(|_| ());
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
