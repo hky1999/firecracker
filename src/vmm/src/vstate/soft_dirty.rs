@@ -587,7 +587,7 @@ pub fn filter_memory_ranges_by_anon_and_soft_dirty(
 
         // Both ledgers read from /proc/self/pagemap; anon additionally
         // consults /proc/kpageflags per present page.
-        let anon_bitmap = pagemap_anon::get_anon_pages(host_addr as u64, length)
+        let (anon_bitmap, _swapped) = pagemap_anon::get_anon_pages(host_addr as u64, length)
             .map_err(IntersectionError::Anon)?;
         let soft_dirty_bitmap =
             get_soft_dirty_pages(host_addr as u64, length).map_err(IntersectionError::SoftDirty)?;
@@ -637,6 +637,32 @@ mod tests {
         );
         let host_addr = guest_memory.get_host_address(GuestAddress(0)).unwrap() as u64;
         assert_eq!(host_addr % page_size, 0);
+        // Pin the fixture against kernel-side interference: parallel tests
+        // allocating memory can trigger compaction/migration, and a migrated
+        // PTE is reinstalled with the soft-dirty bit set — a phantom delta
+        // that breaks the exact-window assertions below. mlocked pages are
+        // unevictable and unmigratable; MADV_NOHUGEPAGE keeps khugepaged
+        // from collapsing the region on hosts running THP=always (a
+        // collapse also re-marks the PTEs soft-dirty). Both are best-effort:
+        // an unprivileged runner may have RLIMIT_MEMLOCK=0, in which case the
+        // tests keep their semantics and merely tolerate the rare flake.
+        // SAFETY: `host_addr` and `length` describe the freshly mapped,
+        // page-aligned fixture region.
+        unsafe {
+            let addr = host_addr as *mut libc::c_void;
+            if libc::madvise(addr, length, libc::MADV_NOHUGEPAGE) != 0 {
+                eprintln!(
+                    "fixture MADV_NOHUGEPAGE failed (tolerated): {}",
+                    io::Error::last_os_error()
+                );
+            }
+            if libc::mlock(addr as *const libc::c_void, length) != 0 {
+                eprintln!(
+                    "fixture mlock failed (migration noise tolerated): {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
         (guest_memory, host_addr, page_size)
     }
 
