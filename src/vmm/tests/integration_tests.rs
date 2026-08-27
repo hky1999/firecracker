@@ -14,6 +14,7 @@ use vmm::persist::{MicrovmState, MicrovmStateError, VmInfo, snapshot_state_sanit
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
+    VmmData,
 };
 use vmm::seccomp::get_empty_filters;
 use vmm::snapshot::Snapshot;
@@ -23,6 +24,7 @@ use vmm::vmm_config::balloon::BalloonDeviceConfig;
 use vmm::vmm_config::boot_source::BootSourceConfig;
 use vmm::vmm_config::drive::BlockDeviceConfig;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
+use vmm::vmm_config::machine_config::DEFAULT_MEM_SIZE_MIB;
 use vmm::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use vmm::vmm_config::net::NetworkInterfaceConfig;
 use vmm::vmm_config::snapshot::{
@@ -247,6 +249,7 @@ fn verify_create_snapshot(
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_file_path: Some(memory_file.as_path().to_path_buf()),
         deferred_sync: false,
+        state_only: false,
     };
 
     controller
@@ -325,6 +328,111 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
 
     assert_eq!(vmm.lock().unwrap().instance_info.state, VmState::Running);
     vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
+/// A successful Incremental snapshot must arm the soft-dirty window so the
+/// next SoftDirty request writes only the window delta instead of taking
+/// the unarmed first-window path and rewriting the cumulative anon baseline
+/// (regression test: the Incremental branch originally returned without
+/// arming, costing every restore lineage one duplicate baseline write).
+#[test]
+fn test_incremental_snapshot_arms_soft_dirty_window() {
+    // The pagemap-anon ledger reads /proc/kpageflags, which requires
+    // CAP_SYS_ADMIN: skip when the runner is unprivileged rather than fail.
+    if std::fs::File::open("/proc/kpageflags").is_err() {
+        eprintln!("skipping: opening /proc/kpageflags requires CAP_SYS_ADMIN");
+        return;
+    }
+
+    let incremental_state = TempFile::new().unwrap();
+    let incremental_memory = TempFile::new().unwrap();
+    let soft_dirty_state = TempFile::new().unwrap();
+    let soft_dirty_memory = TempFile::new().unwrap();
+
+    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+
+    // Incremental snapshots patch a caller-provided memory file that must
+    // already have the full guest memory size (the sandboxd layout step
+    // does this outside the VMM); pre-create both files accordingly.
+    // The mock VM config uses the default 128 MiB guest memory.
+    let memory_size = u64::try_from(DEFAULT_MEM_SIZE_MIB).unwrap() << 20;
+    for file in [&incremental_memory, &soft_dirty_memory] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(file.as_path())
+            .unwrap()
+            .set_len(memory_size)
+            .unwrap();
+    }
+
+    // Let the noisy kernel dirty memory so the cumulative anon set is
+    // non-trivial, then quiesce for the Incremental snapshot.
+    thread::sleep(Duration::from_millis(500));
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Incremental,
+                snapshot_path: incremental_state.as_path().to_path_buf(),
+                mem_file_path: Some(incremental_memory.as_path().to_path_buf()),
+                deferred_sync: false,
+                state_only: false,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+
+    // The ledger must be armed immediately after the Incremental snapshot:
+    // before the fix this reported armed=false, which is exactly what made
+    // the next SoftDirty request rewrite the whole baseline. The vCPUs are
+    // still paused, so the freshly opened window must also be empty.
+    match controller
+        .handle_request(VmmAction::GetDirtyMemoryRanges, &mut event_manager)
+        .unwrap()
+    {
+        VmmData::DirtyMemoryRanges(ranges) => {
+            assert!(ranges.armed, "Incremental snapshot left the ledger unarmed");
+            assert_eq!(
+                ranges.dirty_pages, 0,
+                "nothing ran between the Incremental arm and this preview"
+            );
+        }
+        response => panic!("unexpected response to GetDirtyMemoryRanges: {response:?}"),
+    }
+
+    // Run the guest briefly so the armed window accumulates writes, then
+    // take a SoftDirty snapshot: it must succeed through the window-delta
+    // branch (the armed assertion above pins that branch selection) and
+    // produce a restorable artifact.
+    controller
+        .handle_request(VmmAction::Resume, &mut event_manager)
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::SoftDirty,
+                snapshot_path: soft_dirty_state.as_path().to_path_buf(),
+                mem_file_path: Some(soft_dirty_memory.as_path().to_path_buf()),
+                deferred_sync: false,
+                state_only: false,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+
+    verify_load_snapshot(incremental_state, incremental_memory);
+    verify_load_snapshot(soft_dirty_state, soft_dirty_memory);
 }
 
 #[test]
