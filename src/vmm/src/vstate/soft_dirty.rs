@@ -303,6 +303,20 @@ impl SoftDirtyStats {
     }
 }
 
+/// Interpret one pagemap entry for the soft-dirty window.
+///
+/// The soft-dirty bit is readable without privileges, but it is only
+/// meaningful for present pages. A swapped-out anonymous page (bit 62)
+/// was necessarily written (it entered swap through a write), yet its
+/// soft-dirty bit is unobservable — the intersection filter would
+/// drop it. Report swapped pages as dirty so the anon ∩ dirty
+/// intersection conservatively includes them: including an unchanged
+/// swapped page is a safe superset, dropping a changed one is stale
+/// data at restore.
+fn soft_dirty_entry_reports_dirty(entry: u64) -> bool {
+    (entry & (PAGEMAP_SWAPPED_BIT | PAGEMAP_SOFT_DIRTY_BIT)) != 0
+}
+
 /// Read the soft-dirty bitmap for a host memory region.
 ///
 /// # Arguments
@@ -352,15 +366,7 @@ pub fn get_soft_dirty_pages(host_addr: u64, length: u64) -> Result<Vec<bool>> {
                 .try_into()
                 .unwrap(),
         );
-
-        // The soft-dirty bit is readable without privileges, but it is only
-        // meaningful for present pages. A swapped-out anonymous page (bit 62)
-        // was necessarily written (it entered swap through a write), yet its
-        // soft-dirty bit is unobservable — the intersection filter would
-        // drop it. Report swapped pages as dirty so the anon ∩ dirty
-        // intersection conservatively includes them.
-        let swapped = (entry & PAGEMAP_SWAPPED_BIT) != 0;
-        *item = swapped || (entry & PAGEMAP_SOFT_DIRTY_BIT) != 0;
+        *item = soft_dirty_entry_reports_dirty(entry);
     }
 
     Ok(result)
@@ -648,6 +654,33 @@ mod tests {
     fn test_soft_dirty_constants() {
         assert_eq!(PAGEMAP_SOFT_DIRTY_BIT, 1u64 << 55);
         assert_eq!(CLEAR_REFS_SOFT_DIRTY, b"4\n");
+    }
+
+    /// A swapped anonymous page (bit 62, not present) must be reported as
+    /// dirty: it was necessarily written to reach swap, and its soft-dirty
+    /// bit is unobservable while it stays swapped out. Dropping it would
+    /// hand restore stale data for a page the guest wrote during the
+    /// window; including an unchanged swapped page is a safe superset.
+    #[test]
+    fn test_swapped_entry_reports_dirty() {
+        const PAGEMAP_PRESENT_BIT: u64 = 1 << 63;
+        // Present + soft-dirty: dirty.
+        assert!(soft_dirty_entry_reports_dirty(
+            PAGEMAP_PRESENT_BIT | PAGEMAP_SOFT_DIRTY_BIT
+        ));
+        // Present + clean: not dirty.
+        assert!(!soft_dirty_entry_reports_dirty(PAGEMAP_PRESENT_BIT));
+        // Swapped out (not present) with the soft-dirty bit unreadable
+        // (zero): still dirty — the swap-out itself was a write.
+        assert!(soft_dirty_entry_reports_dirty(PAGEMAP_SWAPPED_BIT));
+        // Swapped out with a stale soft-dirty bit set: dirty either way.
+        assert!(soft_dirty_entry_reports_dirty(
+            PAGEMAP_SWAPPED_BIT | PAGEMAP_SOFT_DIRTY_BIT
+        ));
+        // Neither present nor swapped nor dirty (e.g. a file-backed clean
+        // page): not dirty.
+        assert!(!soft_dirty_entry_reports_dirty(0));
+        assert!(!soft_dirty_entry_reports_dirty(0x1234));
     }
 
     /// F5 state machine: happy path probes once, arms, and `arm` again is a
