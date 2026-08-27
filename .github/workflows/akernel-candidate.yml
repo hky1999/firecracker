@@ -73,6 +73,20 @@ jobs:
             libelf-dev \
             libssl-dev
 
+      # The bundle script builds the fork VMM with the static musl target;
+      # musl-tools provides the x86_64-linux-musl-gcc linker that the Rust
+      # musl target does not install by itself.
+      - name: Install Rust toolchain with the musl target
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo -E apt-get install -y musl-tools
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --default-toolchain stable --profile minimal
+          echo "${HOME}/.cargo/bin" >>"${GITHUB_PATH}"
+          rustup target add x86_64-unknown-linux-musl
+
       - name: Build runtime bundle
         shell: bash
         run: |
@@ -101,7 +115,7 @@ jobs:
             "${GITHUB_RUN_ID}"
           test "$(jq -er '.release_tag' "${manifest}")" = "${RELEASE_TAG}"
           test "$(jq -er '.vmm.source' "${manifest}")" = \
-            "official-release"
+            "fork-source-build"
 
           mkdir extracted
           tar -xzf "${archive}" -C extracted
