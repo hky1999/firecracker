@@ -949,6 +949,47 @@ pub mod tests {
         let req = connection.pop_parsed_request().unwrap();
         ParsedRequest::try_from(&req).unwrap();
 
+        // A create request missing `mem_file_path` without `state_only` is
+        // rejected: the omission must stay an error (pre-fork contract)
+        // instead of silently producing a state-only artifact.
+        let body = "{ \"snapshot_path\": \"foo\" }";
+        sender
+            .write_all(http_request("PUT", "/snapshot/create", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        assert!(ParsedRequest::try_from(&req).is_err());
+
+        // Explicit opt-in state-only snapshot parses.
+        let body = "{ \"snapshot_path\": \"foo\", \"state_only\": true }";
+        sender
+            .write_all(http_request("PUT", "/snapshot/create", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap();
+
+        // `state_only` together with `mem_file_path` is ambiguous and
+        // rejected.
+        let body =
+            "{ \"snapshot_path\": \"foo\", \"mem_file_path\": \"bar\", \"state_only\": true }";
+        sender
+            .write_all(http_request("PUT", "/snapshot/create", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        assert!(ParsedRequest::try_from(&req).is_err());
+
+        // State-only snapshots write no memory and transition no ledger, so
+        // the incremental types are rejected there.
+        let body = "{ \"snapshot_path\": \"foo\", \"state_only\": true, \"snapshot_type\": \"SoftDirty\" }";
+        sender
+            .write_all(http_request("PUT", "/snapshot/create", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        assert!(ParsedRequest::try_from(&req).is_err());
+
         let body = "{ \"snapshot_path\": \"foo\", \"mem_backend\": { \"backend_type\": \"File\", \
                     \"backend_path\": \"bar\" }, \"enable_diff_snapshots\": true }";
         sender

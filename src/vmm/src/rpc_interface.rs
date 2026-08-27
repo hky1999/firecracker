@@ -1269,6 +1269,7 @@ mod tests {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
                 mem_file_path: Some(PathBuf::new()),
+                state_only: false,
                 deferred_sync: false,
             },
         )));

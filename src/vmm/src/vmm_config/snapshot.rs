@@ -55,10 +55,18 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory. When omitted,
-    /// only the microVM state is saved (state-only snapshot) and memory
-    /// dumping is fully delegated to the caller.
+    /// Path to the file that will contain the guest memory. Required unless
+    /// `state_only` is true; the API layer rejects the combination of a
+    /// missing path and `state_only=false` so an accidentally omitted field
+    /// cannot produce a successful but incomplete artifact.
     pub mem_file_path: Option<PathBuf>,
+    /// When true, only the microVM state is saved and memory dumping is
+    /// fully delegated to the caller; `mem_file_path` must be omitted and
+    /// `snapshot_type` must be `Full` (no memory write or ledger transition
+    /// happens). Explicit opt-in: the default (false) preserves the upstream
+    /// contract that a create request always writes the memory file.
+    #[serde(default)]
+    pub state_only: bool,
     /// When true, skip the fsync (`sync_all`) of the state and memory files;
     /// the caller takes over durability (e.g. an orchestrator that fsyncs the
     /// files before committing a manifest). The default (false) preserves the

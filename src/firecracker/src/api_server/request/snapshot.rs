@@ -6,7 +6,7 @@ use vmm::logger::{IncMetric, METRICS};
 use vmm::rpc_interface::VmmAction;
 use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotConfig, LoadSnapshotParams, MemBackendConfig, MemBackendType,
-    Vm, VmState,
+    SnapshotType, Vm, VmState,
 };
 
 use super::super::parsed_request::{ParsedRequest, RequestError};
@@ -61,6 +61,37 @@ pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, Request
 
 fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
+
+    // A create request must either write the memory file or explicitly opt
+    // into a state-only snapshot; an accidentally omitted `mem_file_path`
+    // must stay an error (the pre-fork contract) instead of silently
+    // producing an incomplete artifact.
+    match (
+        snapshot_config.state_only,
+        &snapshot_config.mem_file_path,
+        snapshot_config.snapshot_type,
+    ) {
+        (false, None, _) => {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                "mem_file_path is required unless state_only is true",
+            )));
+        }
+        (true, Some(_), _) => {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                "mem_file_path must be omitted when state_only is true",
+            )));
+        }
+        // State-only snapshots write no memory and transition no ledger, so
+        // the incremental types (which patch a caller-provided base or arm
+        // the soft-dirty window) are meaningless there.
+        (true, None, snapshot_type) if snapshot_type != SnapshotType::Full => {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                "state_only snapshots require snapshot_type Full",
+            )));
+        }
+        _ => {}
+    }
+
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
@@ -154,6 +185,7 @@ mod tests {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: Some(PathBuf::from("bar")),
+            state_only: false,
             deferred_sync: false,
         };
         assert_eq!(
@@ -169,6 +201,7 @@ mod tests {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: Some(PathBuf::from("bar")),
+            state_only: false,
             deferred_sync: false,
         };
         assert_eq!(
@@ -182,15 +215,32 @@ mod tests {
         }"#;
         parse_put_snapshot(&Body::new(invalid_body), Some("create")).unwrap_err();
 
-        // State-only snapshot: no `mem_file_path`, memory dumping is
-        // delegated to the caller.
+        // State-only snapshot: explicit opt-in, no `mem_file_path`, memory
+        // dumping is delegated to the caller. Omitting `mem_file_path`
+        // WITHOUT `state_only` must stay an error.
+        parse_put_snapshot(&Body::new(r#"{ "snapshot_path": "foo" }"#), Some("create"))
+            .unwrap_err();
+        parse_put_snapshot(
+            &Body::new(r#"{ "snapshot_path": "foo", "mem_file_path": "bar", "state_only": true }"#),
+            Some("create"),
+        )
+        .unwrap_err();
+        parse_put_snapshot(
+            &Body::new(
+                r#"{ "snapshot_path": "foo", "state_only": true, "snapshot_type": "SoftDirty" }"#,
+            ),
+            Some("create"),
+        )
+        .unwrap_err();
         let body = r#"{
-            "snapshot_path": "foo"
+            "snapshot_path": "foo",
+            "state_only": true
         }"#;
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: None,
+            state_only: true,
             deferred_sync: false,
         };
         assert_eq!(
@@ -209,6 +259,7 @@ mod tests {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: Some(PathBuf::from("bar")),
+            state_only: false,
             deferred_sync: true,
         };
         assert_eq!(

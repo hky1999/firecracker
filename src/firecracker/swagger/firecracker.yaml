@@ -1649,12 +1649,20 @@ definitions:
       mem_file_path:
         type: string
         description:
-          Path to the file that will contain the guest memory. When
-          omitted, only the microVM state is saved (state-only snapshot)
-          and memory dumping is delegated to the caller.
+          Path to the file that will contain the guest memory. Required
+          unless `state_only` is true; a request that omits it without
+          `state_only` is rejected.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.
+      state_only:
+        type: boolean
+        default: false
+        description:
+          When true, only the microVM state is saved and memory dumping is
+          delegated to the caller. `mem_file_path` must be omitted and
+          `snapshot_type` must be Full (state-only snapshots write no memory
+          and transition no ledger).
       snapshot_type:
         type: string
         enum:

@@ -189,9 +189,14 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path, params.deferred_sync)?;
 
-    // State-only snapshot when `mem_file_path` is absent: memory dumping is
-    // fully delegated to the caller.
-    let kvm_vm = if let Some(mem_file_path) = &params.mem_file_path {
+    // Explicit state-only snapshot: memory dumping is fully delegated to
+    // the caller. The API layer rejects `state_only` without the matching
+    // field combination, so reaching here with a memory path is a bug.
+    let kvm_vm = if !params.state_only {
+        let mem_file_path = params
+            .mem_file_path
+            .as_ref()
+            .expect("state_only=false requires mem_file_path; the API layer enforces it");
         let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
             CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
                 "snapshot requires KVM".into(),
