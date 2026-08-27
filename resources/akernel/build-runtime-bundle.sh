@@ -34,9 +34,6 @@ source "${VERSIONS_FILE}"
 
 required_versions=(
     FIRECRACKER_VERSION
-    FIRECRACKER_X86_64_ARCHIVE_SHA256
-    FIRECRACKER_X86_64_BINARY_SHA256
-    FIRECRACKER_RELEASE_BASE_URL
     GUEST_KERNEL_VERSION
     GUEST_KERNEL_TAG
     GUEST_KERNEL_SOURCE_BASE_URL
@@ -51,7 +48,7 @@ done
 [ "$(uname -m)" = "x86_64" ] ||
     fail "only x86_64 AKernel bundles are currently supported"
 
-for command_name in curl file gcc gzip jq make sha256sum tar; do
+for command_name in cargo curl file gcc gzip jq make sha256sum tar; do
     command -v "${command_name}" >/dev/null 2>&1 ||
         fail "missing command: ${command_name}"
 done
@@ -68,25 +65,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "${output_dir}" "${work_dir}/official" "${work_dir}/linux" \
-    "${work_dir}/package"
+mkdir -p "${output_dir}" "${work_dir}/linux" "${work_dir}/package"
 
-official_archive="${work_dir}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz"
-official_url="${FIRECRACKER_RELEASE_BASE_URL}/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz"
-log "downloading official Firecracker v${FIRECRACKER_VERSION}"
-curl -fSL --retry 10 --retry-delay 2 --retry-all-errors \
-    "${official_url}" -o "${official_archive}"
-printf '%s  %s\n' "${FIRECRACKER_X86_64_ARCHIVE_SHA256}" \
-    "${official_archive}" | sha256sum --check -
-tar -xzf "${official_archive}" -C "${work_dir}/official"
-
-official_dir="${work_dir}/official/release-v${FIRECRACKER_VERSION}-x86_64"
-official_binary="${official_dir}/firecracker-v${FIRECRACKER_VERSION}-x86_64"
-[ -x "${official_binary}" ] ||
-    fail "official Firecracker archive is missing its x86_64 binary"
-printf '%s  %s\n' "${FIRECRACKER_X86_64_BINARY_SHA256}" \
-    "${official_binary}" | sha256sum --check -
-"${official_binary}" --version
+# The bundle must carry the VMM this fork builds — the official upstream
+# binary lacks the fork's snapshot API (snapshot_type, deferred_sync,
+# mem_backend=Uffd). Build the static musl release from the checkout so
+# the released bytes match the committed source.
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    cargo_target_dir="${CARGO_TARGET_DIR}"
+else
+    cargo_target_dir="${ROOT_DIR}/build/cargo_target"
+    [ -d "${cargo_target_dir}" ] || cargo_target_dir="${ROOT_DIR}/target"
+fi
+log "building Firecracker VMM from ${ROOT_DIR} (musl release)"
+(
+    cd "${ROOT_DIR}"
+    cargo build --release --target x86_64-unknown-linux-musl -p firecracker
+)
+vmm_source_binary="${cargo_target_dir}/x86_64-unknown-linux-musl/release/firecracker"
+[ -x "${vmm_source_binary}" ] ||
+    fail "built Firecracker binary not found at ${vmm_source_binary}"
+"${vmm_source_binary}" --version | grep -F "Firecracker v${FIRECRACKER_VERSION}" ||
+    fail "built VMM does not report Firecracker v${FIRECRACKER_VERSION}"
 
 kernel_archive="${work_dir}/amazon-linux-kernel.tar.gz"
 kernel_url="${GUEST_KERNEL_SOURCE_BASE_URL}/${GUEST_KERNEL_TAG}"
@@ -138,12 +138,12 @@ bundle_dir="${work_dir}/package/${bundle_dir_name}"
 mkdir -p "${bundle_dir}/licenses/firecracker" \
     "${bundle_dir}/licenses/linux"
 
-install -m 0755 "${official_binary}" "${bundle_dir}/firecracker"
+install -m 0755 "${vmm_source_binary}" "${bundle_dir}/firecracker"
 install -m 0644 vmlinux "${bundle_dir}/vmlinux"
 install -m 0644 .config "${bundle_dir}/kernel.config"
 install -m 0644 COPYING "${bundle_dir}/licenses/linux/COPYING"
 for license_file in LICENSE NOTICE THIRD-PARTY; do
-    install -m 0644 "${official_dir}/${license_file}" \
+    install -m 0644 "${ROOT_DIR}/${license_file}" \
         "${bundle_dir}/licenses/firecracker/${license_file}"
 done
 
@@ -161,8 +161,7 @@ jq -n \
     --arg release_tag "${release_tag}" \
     --arg architecture x86_64 \
     --arg vmm_version "v${FIRECRACKER_VERSION}" \
-    --arg vmm_url "${official_url}" \
-    --arg vmm_archive_sha256 "${FIRECRACKER_X86_64_ARCHIVE_SHA256}" \
+    --arg vmm_url "https://github.com/${source_repository}/tree/${source_commit}" \
     --arg vmm_sha256 "${vmm_sha256}" \
     --arg kernel_repository https://github.com/amazonlinux/linux \
     --arg kernel_tag "${GUEST_KERNEL_TAG}" \
@@ -185,10 +184,9 @@ jq -n \
         release_tag: $release_tag,
         architecture: $architecture,
         vmm: {
-            source: "official-release",
+            source: "fork-source-build",
             version: $vmm_version,
             url: $vmm_url,
-            archive_sha256: $vmm_archive_sha256,
             binary_sha256: $vmm_sha256
         },
         guest_kernel: {
