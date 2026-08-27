@@ -797,13 +797,19 @@ impl KvmVm {
                     // full guest state — pages dirtied between the previous
                     // base and this discarded generation are in neither the
                     // old base nor the new window. The caller's recovery is
-                    // to clear its lineage tracking (sandboxd calls
-                    // `clearBaseMemory`) and force the next checkpoint to a
-                    // SoftDirty FIRST WINDOW, which writes the complete anon
-                    // baseline and re-derives the full state from scratch.
-                    // The first-window path is correct regardless of the
-                    // ledger's armed state because it does not diff against
-                    // any base.
+                    // to mark its lineage lost (sandboxd's
+                    // `markBaseMemoryLineageLost`) and force the next
+                    // checkpoint to FULL. Full never consults this ledger
+                    // and writes the complete memory image, and the window
+                    // re-opened above keeps accumulating, so the delta taken
+                    // AFTER the Full write is a superset of what the Full
+                    // image missed and patches safely onto it. A SoftDirty
+                    // request is NOT a safe recovery here: the armed ledger
+                    // takes the window-delta branch above and would write
+                    // only the delta into the caller's empty base. The
+                    // unarmed (first-window) branch below is only reached
+                    // when no window has been opened since the VMM started
+                    // or since its last write failure.
                     if let Err(e) = accounting.ack_persisted() {
                         accounting.disarm();
                         return Err(e.into());
