@@ -75,16 +75,25 @@ jobs:
 
       # The bundle script builds the fork VMM with the static musl target;
       # musl-tools provides the x86_64-linux-musl-gcc linker that the Rust
-      # musl target does not install by itself.
+      # musl target does not install by itself. The musl C headers do not
+      # ship the kernel UAPI headers that C-based build scripts need
+      # (userfaultfd-sys includes <linux/types.h>), so mirror the devctr
+      # fix: symlink the gnu UAPI headers into the musl include directory.
       - name: Install Rust toolchain with the musl target
         shell: bash
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           sudo -E apt-get install -y musl-tools
+          arch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+          cd "/usr/include/${arch}-musl"
+          sudo ln -s "../${arch}/asm" asm
+          sudo ln -s ../linux linux
+          sudo ln -s ../asm-generic asm-generic
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
             sh -s -- -y --default-toolchain stable --profile minimal
           echo "${HOME}/.cargo/bin" >>"${GITHUB_PATH}"
+          rustup component add rustfmt
           rustup target add x86_64-unknown-linux-musl
 
       - name: Build runtime bundle
