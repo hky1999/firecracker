@@ -79,18 +79,38 @@ jobs:
       # ship the kernel UAPI headers that C-based build scripts need
       # (userfaultfd-sys includes <linux/types.h>), so mirror the devctr
       # fix: symlink the gnu UAPI headers into the musl include directory.
+      # Mirror the devctr musl toolchain setup: musl-tools provides the
+      # musl-gcc wrapper; the musl C headers do not ship the kernel UAPI
+      # headers that C-based build scripts need (userfaultfd-sys includes
+      # <linux/types.h>), so symlink the gnu UAPI headers into the musl
+      # include directory; and libseccomp must be built from source with
+      # musl-gcc (the distribution build is gnu-only) and installed into
+      # /usr/local, which the link line already searches. The gnu-side
+      # build scripts additionally need libseccomp-dev.
       - name: Install Rust toolchain with the musl target
         shell: bash
+        env:
+          LIBSECCOMP_VER: v2.6.0
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          sudo -E apt-get install -y musl-tools
+          sudo -E apt-get install -y \
+            musl-tools libseccomp-dev libtool gperf autoconf automake
           gnu_triple="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
           musl_include="/usr/include/$(uname -m)-linux-musl"
           cd "${musl_include}"
           sudo ln -s "../${gnu_triple}/asm" asm
           sudo ln -s ../linux linux
           sudo ln -s ../asm-generic asm-generic
+
+          git clone --depth 1 --branch "${LIBSECCOMP_VER}" \
+            https://github.com/seccomp/libseccomp /tmp/libseccomp
+          cd /tmp/libseccomp
+          ./autogen.sh
+          CC="musl-gcc -static" ./configure \
+            --enable-static=yes --enable-shared=false
+          sudo make install
+
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
             sh -s -- -y --default-toolchain stable --profile minimal
           echo "${HOME}/.cargo/bin" >>"${GITHUB_PATH}"
