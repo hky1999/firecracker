@@ -71,20 +71,25 @@ mkdir -p "${output_dir}" "${work_dir}/linux" "${work_dir}/package"
 # binary lacks the fork's snapshot API (snapshot_type, deferred_sync,
 # mem_backend=Uffd). Build the static musl release from the checkout so
 # the released bytes match the committed source.
-if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-    cargo_target_dir="${CARGO_TARGET_DIR}"
-else
-    cargo_target_dir="${ROOT_DIR}/build/cargo_target"
-    [ -d "${cargo_target_dir}" ] || cargo_target_dir="${ROOT_DIR}/target"
-fi
 log "building Firecracker VMM from ${ROOT_DIR} (musl release)"
 (
     cd "${ROOT_DIR}"
     cargo build --release --target x86_64-unknown-linux-musl -p firecracker
 )
-vmm_source_binary="${cargo_target_dir}/x86_64-unknown-linux-musl/release/firecracker"
-[ -x "${vmm_source_binary}" ] ||
-    fail "built Firecracker binary not found at ${vmm_source_binary}"
+# The repository .cargo/config.toml redirects target-dir to
+# build/cargo_target, an exported CARGO_TARGET_DIR overrides it, and a
+# pristine checkout may have neither directory yet — resolve after the
+# build by probing the candidates.
+vmm_source_binary=""
+for candidate in     "${CARGO_TARGET_DIR:-}"     "${ROOT_DIR}/build/cargo_target"     "${ROOT_DIR}/target"; do
+    [ -n "${candidate}" ] || continue
+    if [ -x "${candidate}/x86_64-unknown-linux-musl/release/firecracker" ]; then
+        vmm_source_binary="${candidate}/x86_64-unknown-linux-musl/release/firecracker"
+        break
+    fi
+done
+[ -n "${vmm_source_binary}" ] ||
+    fail "built Firecracker binary not found under CARGO_TARGET_DIR, build/cargo_target, or target"
 "${vmm_source_binary}" --version | grep -F "Firecracker v${FIRECRACKER_VERSION}" ||
     fail "built VMM does not report Firecracker v${FIRECRACKER_VERSION}"
 
