@@ -355,17 +355,15 @@ fn test_incremental_snapshot_arms_soft_dirty_window() {
 
     // Incremental snapshots patch a caller-provided memory file that must
     // already have the full guest memory size (the sandboxd layout step
-    // does this outside the VMM); pre-create both files accordingly.
-    // The mock VM config uses the default 128 MiB guest memory.
+    // does this outside the VMM). The mock VM config uses the default
+    // 128 MiB guest memory.
     let memory_size = u64::try_from(DEFAULT_MEM_SIZE_MIB).unwrap() << 20;
-    for file in [&incremental_memory, &soft_dirty_memory] {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(file.as_path())
-            .unwrap()
-            .set_len(memory_size)
-            .unwrap();
-    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(incremental_memory.as_path())
+        .unwrap()
+        .set_len(memory_size)
+        .unwrap();
 
     // Let the noisy kernel dirty memory so the cumulative anon set is
     // non-trivial, then quiesce for the Incremental snapshot.
@@ -405,17 +403,32 @@ fn test_incremental_snapshot_arms_soft_dirty_window() {
         response => panic!("unexpected response to GetDirtyMemoryRanges: {response:?}"),
     }
 
+    // Production contract: the caller prepares the SoftDirty output as a
+    // copy of the previously committed complete memory image (a reflink
+    // clone in the sandboxd layout), and the snapshot patches only the
+    // window delta into that clone — not into a zero file.
+    std::fs::copy(incremental_memory.as_path(), soft_dirty_memory.as_path()).unwrap();
+
     // Run the guest briefly so the armed window accumulates writes, then
-    // take a SoftDirty snapshot: it must succeed through the window-delta
-    // branch (the armed assertion above pins that branch selection) and
-    // produce a restorable artifact.
+    // pause and preview the exact window the next snapshot will write
+    // (nothing runs between the preview and the snapshot while paused).
     controller
         .handle_request(VmmAction::Resume, &mut event_manager)
         .unwrap();
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(200));
     controller
         .handle_request(VmmAction::Pause, &mut event_manager)
         .unwrap();
+    let preview_dirty_pages = match controller
+        .handle_request(VmmAction::GetDirtyMemoryRanges, &mut event_manager)
+        .unwrap()
+    {
+        VmmData::DirtyMemoryRanges(ranges) => {
+            assert!(ranges.armed);
+            ranges.dirty_pages
+        }
+        response => panic!("unexpected response to GetDirtyMemoryRanges: {response:?}"),
+    };
     controller
         .handle_request(
             VmmAction::CreateSnapshot(CreateSnapshotParams {
@@ -430,6 +443,30 @@ fn test_incremental_snapshot_arms_soft_dirty_window() {
         .unwrap();
 
     vmm.lock().unwrap().stop(FcExitCode::Ok);
+
+    // Data-level proof of the clone-plus-window contract: the SoftDirty
+    // artifact may differ from the Incremental baseline only in pages the
+    // window preview reported (the snapshot cannot write pages outside the
+    // window, and the guest must have dirtied at least one page while
+    // resumed). A patch into a zero file would instead differ on every
+    // non-zero baseline page.
+    let page_size = 4096usize;
+    let baseline = std::fs::read(incremental_memory.as_path()).unwrap();
+    let patched = std::fs::read(soft_dirty_memory.as_path()).unwrap();
+    assert_eq!(baseline.len(), patched.len());
+    let differing_pages = baseline
+        .chunks(page_size)
+        .zip(patched.chunks(page_size))
+        .filter(|(old, new)| old != new)
+        .count();
+    assert!(
+        differing_pages > 0,
+        "the resumed guest dirtied no pages in the window"
+    );
+    assert!(
+        u64::try_from(differing_pages).unwrap() <= preview_dirty_pages,
+        "SoftDirty snapshot wrote {differing_pages} pages but the window preview          reported only {preview_dirty_pages} dirty pages"
+    );
 
     verify_load_snapshot(incremental_state, incremental_memory);
     verify_load_snapshot(soft_dirty_state, soft_dirty_memory);

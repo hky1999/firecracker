@@ -34,7 +34,9 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -168,6 +170,8 @@ pub enum CreateSnapshotError {
         /// Full guest memory size in bytes.
         expected: u64,
     },
+    /// Invalid create-snapshot parameter combination: {0}
+    InvalidParams(&'static str),
     /// pagemap-anon ledger error: {0}
     PagemapAnon(#[from] crate::vstate::pagemap_anon::PagemapAnonError),
     /// soft-dirty ledger error: {0}
@@ -189,14 +193,33 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path, params.deferred_sync)?;
 
-    // Explicit state-only snapshot: memory dumping is fully delegated to
-    // the caller. The API layer rejects `state_only` without the matching
-    // field combination, so reaching here with a memory path is a bug.
-    let kvm_vm = if !params.state_only {
-        let mem_file_path = params
-            .mem_file_path
-            .as_ref()
-            .expect("state_only=false requires mem_file_path; the API layer enforces it");
+    // The API layer rejects invalid field combinations early (friendlier
+    // errors, no VMM state touched), but `VmmAction::CreateSnapshot` can
+    // also be constructed directly by controller code and tests — validate
+    // again here and return an error instead of panicking.
+    let mem_file_path = match (params.state_only, params.mem_file_path.as_ref()) {
+        // Explicit state-only snapshot: memory dumping is fully delegated
+        // to the caller (only the state file is written).
+        (true, None) if params.snapshot_type == SnapshotType::Full => None,
+        (false, Some(path)) => Some(path),
+        (true, None) => {
+            return Err(CreateSnapshotError::InvalidParams(
+                "state_only snapshots require snapshot_type Full: no memory write                  or ledger transition happens",
+            ));
+        }
+        (true, Some(_)) => {
+            return Err(CreateSnapshotError::InvalidParams(
+                "mem_file_path must be omitted when state_only is true",
+            ));
+        }
+        (false, None) => {
+            return Err(CreateSnapshotError::InvalidParams(
+                "mem_file_path is required unless state_only is true",
+            ));
+        }
+    };
+
+    let kvm_vm = if let Some(mem_file_path) = mem_file_path {
         let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
             CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
                 "snapshot requires KVM".into(),

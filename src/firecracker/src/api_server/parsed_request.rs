@@ -958,7 +958,7 @@ pub mod tests {
             .unwrap();
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
-        assert!(ParsedRequest::try_from(&req).is_err());
+        ParsedRequest::try_from(&req).unwrap_err();
 
         // Explicit opt-in state-only snapshot parses.
         let body = "{ \"snapshot_path\": \"foo\", \"state_only\": true }";
@@ -978,7 +978,7 @@ pub mod tests {
             .unwrap();
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
-        assert!(ParsedRequest::try_from(&req).is_err());
+        ParsedRequest::try_from(&req).unwrap_err();
 
         // State-only snapshots write no memory and transition no ledger, so
         // the incremental types are rejected there.
@@ -988,7 +988,7 @@ pub mod tests {
             .unwrap();
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
-        assert!(ParsedRequest::try_from(&req).is_err());
+        ParsedRequest::try_from(&req).unwrap_err();
 
         let body = "{ \"snapshot_path\": \"foo\", \"mem_backend\": { \"backend_type\": \"File\", \
                     \"backend_path\": \"bar\" }, \"enable_diff_snapshots\": true }";
