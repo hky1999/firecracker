@@ -124,6 +124,7 @@ jobs:
           echo "commit=${commit}" >>"${GITHUB_OUTPUT}"
           echo "release_tag=${release_tag}" >>"${GITHUB_OUTPUT}"
           echo "vmm_version=${vmm_version}" >>"${GITHUB_OUTPUT}"
+          echo "vmm_source=$(jq -er '.vmm.source' "${manifest}")" >>"${GITHUB_OUTPUT}"
           echo "kernel_tag=${kernel_tag}" >>"${GITHUB_OUTPUT}"
           echo "archive=${archive}" >>"${GITHUB_OUTPUT}"
           echo "archive_checksum=${archive_checksum}" >>"${GITHUB_OUTPUT}"
@@ -159,13 +160,23 @@ jobs:
           MANIFEST: ${{ steps.candidate.outputs.manifest }}
           RELEASE_TAG: ${{ steps.candidate.outputs.release_tag }}
           VMM_VERSION: ${{ steps.candidate.outputs.vmm_version }}
+          VMM_SOURCE: ${{ steps.candidate.outputs.vmm_source }}
           KERNEL_TAG: ${{ steps.candidate.outputs.kernel_tag }}
         run: |
           set -euo pipefail
 
           notes="${RUNNER_TEMP}/release-notes.md"
           {
-            echo "AKernel runtime bundle using the official Firecracker ${VMM_VERSION} VMM."
+            if [ "${VMM_SOURCE}" = "fork-source-build" ]; then
+              echo "AKernel runtime bundle using a fork-built Firecracker ${VMM_VERSION} VMM"
+              echo "(source: this repository, \`vmm.source=fork-source-build\` in the manifest)."
+              echo "On top of the official v${VMM_VERSION#v} baseline it adds incremental"
+              echo "checkpoint/restore snapshot support: soft-dirty window ledgers,"
+              echo "pagemap-anon cumulative baselines, and deferred durability"
+              echo "(\`deferred_sync\`)."
+            else
+              echo "AKernel runtime bundle using the official Firecracker ${VMM_VERSION} VMM."
+            fi
             echo
             echo "The guest kernel is built from Amazon Linux ${KERNEL_TAG} with the AKernel EROFS configuration fragment."
             echo
