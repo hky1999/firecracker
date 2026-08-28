@@ -26,7 +26,9 @@ use super::request::metrics::parse_put_metrics;
 use super::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use super::request::net::{parse_patch_net, parse_put_net};
 use super::request::pmem::{parse_patch_pmem, parse_put_pmem};
-use super::request::snapshot::{parse_patch_vm_state, parse_put_snapshot};
+use super::request::snapshot::{
+    parse_get_dirty_memory_ranges, parse_patch_vm_state, parse_put_snapshot,
+};
 use super::request::version::parse_get_version;
 use super::request::vsock::parse_put_vsock;
 use crate::api_server::request::hotplug::memory::{
@@ -85,6 +87,13 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "", None) => parse_get_instance_info(),
             (Method::Get, "balloon", None) => parse_get_balloon(path_tokens),
             (Method::Get, "version", None) => parse_get_version(),
+            // The vm/* sub-path is resolved once up front: a match guard
+            // that consumed a token would starve every later "vm" route.
+            (Method::Get, "vm", None)
+                if path_tokens.clone().next() == Some("dirty-memory-ranges") =>
+            {
+                parse_get_dirty_memory_ranges()
+            }
             (Method::Get, "vm", None) if path_tokens.next() == Some("config") => {
                 Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig))
             }
@@ -202,6 +211,7 @@ impl ParsedRequest {
                     Self::success_response_with_data(balloon_config)
                 }
                 VmmData::BalloonStats(stats) => Self::success_response_with_data(stats),
+                VmmData::DirtyMemoryRanges(ranges) => Self::success_response_with_data(ranges),
                 VmmData::VirtioMemStatus(data) => Self::success_response_with_data(data),
                 VmmData::HintingStatus(hinting_status) => {
                     Self::success_response_with_data(hinting_status)
@@ -450,6 +460,22 @@ pub mod tests {
     }
 
     #[test]
+    fn test_get_dirty_memory_ranges_request() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/vm/dirty-memory-ranges", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+
+        let req = connection.pop_parsed_request().unwrap();
+        match ParsedRequest::try_from(&req).unwrap().into_parts() {
+            (RequestAction::Sync(action), _) if *action == VmmAction::GetDirtyMemoryRanges => {}
+            _ => panic!("Test failed."),
+        }
+    }
+
+    #[test]
     fn test_checked_id() {
         checked_id("dummy").unwrap();
         checked_id("dummy_1").unwrap();
@@ -605,6 +631,9 @@ pub mod tests {
                 }
                 VmmData::BalloonStats(stats) => {
                     http_response(&serde_json::to_string(stats).unwrap(), 200)
+                }
+                VmmData::DirtyMemoryRanges(ranges) => {
+                    http_response(&serde_json::to_string(ranges).unwrap(), 200)
                 }
                 VmmData::VirtioMemStatus(data) => {
                     http_response(&serde_json::to_string(data).unwrap(), 200)
@@ -919,6 +948,47 @@ pub mod tests {
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
         ParsedRequest::try_from(&req).unwrap();
+
+        // A create request missing `mem_file_path` without `state_only` is
+        // rejected: the omission must stay an error (pre-fork contract)
+        // instead of silently producing a state-only artifact.
+        let body = "{ \"snapshot_path\": \"foo\" }";
+        sender
+            .write_all(http_request("PUT", "/snapshot/create", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap_err();
+
+        // Explicit opt-in state-only snapshot parses.
+        let body = "{ \"snapshot_path\": \"foo\", \"state_only\": true }";
+        sender
+            .write_all(http_request("PUT", "/snapshot/create", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap();
+
+        // `state_only` together with `mem_file_path` is ambiguous and
+        // rejected.
+        let body =
+            "{ \"snapshot_path\": \"foo\", \"mem_file_path\": \"bar\", \"state_only\": true }";
+        sender
+            .write_all(http_request("PUT", "/snapshot/create", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap_err();
+
+        // State-only snapshots write no memory and transition no ledger, so
+        // the incremental types are rejected there.
+        let body = "{ \"snapshot_path\": \"foo\", \"state_only\": true, \"snapshot_type\": \"SoftDirty\" }";
+        sender
+            .write_all(http_request("PUT", "/snapshot/create", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap_err();
 
         let body = "{ \"snapshot_path\": \"foo\", \"mem_backend\": { \"backend_type\": \"File\", \
                     \"backend_path\": \"bar\" }, \"enable_diff_snapshots\": true }";

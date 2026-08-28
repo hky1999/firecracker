@@ -10,10 +10,13 @@ use std::time::Duration;
 
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
-use vmm::persist::{MicrovmState, MicrovmStateError, VmInfo, snapshot_state_sanity_check};
+use vmm::persist::{
+    CreateSnapshotError, MicrovmState, MicrovmStateError, VmInfo, snapshot_state_sanity_check,
+};
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
+    VmmData,
 };
 use vmm::seccomp::get_empty_filters;
 use vmm::snapshot::Snapshot;
@@ -23,6 +26,7 @@ use vmm::vmm_config::balloon::BalloonDeviceConfig;
 use vmm::vmm_config::boot_source::BootSourceConfig;
 use vmm::vmm_config::drive::BlockDeviceConfig;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
+use vmm::vmm_config::machine_config::DEFAULT_MEM_SIZE_MIB;
 use vmm::vmm_config::machine_config::{MachineConfig, MachineConfigUpdate};
 use vmm::vmm_config::net::NetworkInterfaceConfig;
 use vmm::vmm_config::snapshot::{
@@ -245,7 +249,9 @@ fn verify_create_snapshot(
     let snapshot_params = CreateSnapshotParams {
         snapshot_type,
         snapshot_path: snapshot_file.as_path().to_path_buf(),
-        mem_file_path: memory_file.as_path().to_path_buf(),
+        mem_file_path: Some(memory_file.as_path().to_path_buf()),
+        deferred_sync: false,
+        state_only: false,
     };
 
     controller
@@ -324,6 +330,218 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
 
     assert_eq!(vmm.lock().unwrap().instance_info.state, VmState::Running);
     vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
+/// Invalid `CreateSnapshotParams` combinations constructed directly as a
+/// `VmmAction` (the non-HTTP path) must be rejected with `InvalidParams`
+/// before any snapshot work happens: no VM state capture, and the
+/// caller-provided snapshot_path file must be left byte-for-byte intact.
+#[test]
+fn test_create_snapshot_invalid_params_no_side_effects() {
+    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+
+    thread::sleep(Duration::from_millis(100));
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+
+    let sentinel = b"pre-existing artifact, must survive rejected requests";
+    let invalid_params = [
+        // state_only=false without mem_file_path.
+        CreateSnapshotParams {
+            snapshot_type: SnapshotType::Full,
+            snapshot_path: std::path::PathBuf::new(),
+            mem_file_path: None,
+            deferred_sync: false,
+            state_only: false,
+        },
+        // state_only=true with mem_file_path.
+        CreateSnapshotParams {
+            snapshot_type: SnapshotType::Full,
+            snapshot_path: std::path::PathBuf::new(),
+            mem_file_path: Some(std::path::PathBuf::new()),
+            deferred_sync: false,
+            state_only: true,
+        },
+        // state_only=true with an incremental type.
+        CreateSnapshotParams {
+            snapshot_type: SnapshotType::SoftDirty,
+            snapshot_path: std::path::PathBuf::new(),
+            mem_file_path: None,
+            deferred_sync: false,
+            state_only: true,
+        },
+    ];
+    for params in invalid_params {
+        let state_file = TempFile::new().unwrap();
+        std::fs::write(state_file.as_path(), sentinel).unwrap();
+        let mut params = params;
+        params.snapshot_path = state_file.as_path().to_path_buf();
+
+        let error = controller
+            .handle_request(VmmAction::CreateSnapshot(params), &mut event_manager)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VmmActionError::CreateSnapshot(CreateSnapshotError::InvalidParams(_))
+            ),
+            "expected InvalidParams, got: {error:?}"
+        );
+
+        // The rejected request must not have touched the file.
+        assert_eq!(
+            std::fs::read(state_file.as_path()).unwrap(),
+            sentinel,
+            "rejected create request modified snapshot_path"
+        );
+    }
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
+/// A successful Incremental snapshot must arm the soft-dirty window so the
+/// next SoftDirty request writes only the window delta instead of taking
+/// the unarmed first-window path and rewriting the cumulative anon baseline
+/// (regression test: the Incremental branch originally returned without
+/// arming, costing every restore lineage one duplicate baseline write).
+#[test]
+fn test_incremental_snapshot_arms_soft_dirty_window() {
+    // The pagemap-anon ledger reads /proc/kpageflags, which requires
+    // CAP_SYS_ADMIN: skip when the runner is unprivileged rather than fail.
+    if std::fs::File::open("/proc/kpageflags").is_err() {
+        eprintln!("skipping: opening /proc/kpageflags requires CAP_SYS_ADMIN");
+        return;
+    }
+
+    let incremental_state = TempFile::new().unwrap();
+    let incremental_memory = TempFile::new().unwrap();
+    let soft_dirty_state = TempFile::new().unwrap();
+    let soft_dirty_memory = TempFile::new().unwrap();
+
+    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+
+    // Incremental snapshots patch a caller-provided memory file that must
+    // already have the full guest memory size (the sandboxd layout step
+    // does this outside the VMM). The mock VM config uses the default
+    // 128 MiB guest memory.
+    let memory_size = u64::try_from(DEFAULT_MEM_SIZE_MIB).unwrap() << 20;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(incremental_memory.as_path())
+        .unwrap()
+        .set_len(memory_size)
+        .unwrap();
+
+    // Let the noisy kernel dirty memory so the cumulative anon set is
+    // non-trivial, then quiesce for the Incremental snapshot.
+    thread::sleep(Duration::from_millis(500));
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Incremental,
+                snapshot_path: incremental_state.as_path().to_path_buf(),
+                mem_file_path: Some(incremental_memory.as_path().to_path_buf()),
+                deferred_sync: false,
+                state_only: false,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+
+    // The ledger must be armed immediately after the Incremental snapshot:
+    // before the fix this reported armed=false, which is exactly what made
+    // the next SoftDirty request rewrite the whole baseline. The vCPUs are
+    // still paused, so the freshly opened window must also be empty.
+    match controller
+        .handle_request(VmmAction::GetDirtyMemoryRanges, &mut event_manager)
+        .unwrap()
+    {
+        VmmData::DirtyMemoryRanges(ranges) => {
+            assert!(ranges.armed, "Incremental snapshot left the ledger unarmed");
+            assert_eq!(
+                ranges.dirty_pages, 0,
+                "nothing ran between the Incremental arm and this preview"
+            );
+        }
+        response => panic!("unexpected response to GetDirtyMemoryRanges: {response:?}"),
+    }
+
+    // Production contract: the caller prepares the SoftDirty output as a
+    // copy of the previously committed complete memory image (a reflink
+    // clone in the sandboxd layout), and the snapshot patches only the
+    // window delta into that clone — not into a zero file.
+    std::fs::copy(incremental_memory.as_path(), soft_dirty_memory.as_path()).unwrap();
+
+    // Run the guest briefly so the armed window accumulates writes, then
+    // pause and preview the exact window the next snapshot will write
+    // (nothing runs between the preview and the snapshot while paused).
+    controller
+        .handle_request(VmmAction::Resume, &mut event_manager)
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+    let preview_dirty_pages = match controller
+        .handle_request(VmmAction::GetDirtyMemoryRanges, &mut event_manager)
+        .unwrap()
+    {
+        VmmData::DirtyMemoryRanges(ranges) => {
+            assert!(ranges.armed);
+            ranges.dirty_pages
+        }
+        response => panic!("unexpected response to GetDirtyMemoryRanges: {response:?}"),
+    };
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::SoftDirty,
+                snapshot_path: soft_dirty_state.as_path().to_path_buf(),
+                mem_file_path: Some(soft_dirty_memory.as_path().to_path_buf()),
+                deferred_sync: false,
+                state_only: false,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+
+    // Data-level proof of the clone-plus-window contract: the SoftDirty
+    // artifact may differ from the Incremental baseline only in pages the
+    // window preview reported (the snapshot cannot write pages outside the
+    // window, and the guest must have dirtied at least one page while
+    // resumed). A patch into a zero file would instead differ on every
+    // non-zero baseline page.
+    let page_size = 4096usize;
+    let baseline = std::fs::read(incremental_memory.as_path()).unwrap();
+    let patched = std::fs::read(soft_dirty_memory.as_path()).unwrap();
+    assert_eq!(baseline.len(), patched.len());
+    let differing_pages = baseline
+        .chunks(page_size)
+        .zip(patched.chunks(page_size))
+        .filter(|(old, new)| old != new)
+        .count();
+    assert!(
+        differing_pages > 0,
+        "the resumed guest dirtied no pages in the window"
+    );
+    assert!(
+        u64::try_from(differing_pages).unwrap() <= preview_dirty_pages,
+        "SoftDirty snapshot wrote {differing_pages} pages but the window preview          reported only {preview_dirty_pages} dirty pages"
+    );
+
+    verify_load_snapshot(incremental_state, incremental_memory);
+    verify_load_snapshot(soft_dirty_state, soft_dirty_memory);
 }
 
 #[test]

@@ -76,7 +76,7 @@ jobs:
           [[ "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-akernel\.[0-9]+$ ]]
           test "${vmm_version}" = "${release_tag%-akernel.*}"
           test "$(jq -er '.vmm.source' "${manifest}")" = \
-            "official-release"
+            "fork-source-build"
 
           archive="${candidate_dir}/firecracker-${release_tag}-x86_64.tgz"
           archive_checksum="${archive}.sha256"

@@ -18,6 +18,18 @@ pub enum SnapshotType {
     /// Full snapshot.
     #[default]
     Full,
+    /// Incremental snapshot via the cumulative pagemap-anon ledger: writes
+    /// every CoW anonymous (guest-written) page into the existing base
+    /// memory file. The base must be pre-created by the caller (typically a
+    /// reflink clone of the restore memory file); FC reports an explicit
+    /// error instead of silently writing a wrong file when it is missing.
+    Incremental,
+    /// Incremental snapshot via the soft-dirty (pagemap bit 55) window
+    /// ledger: writes only pages written since the previous successful
+    /// snapshot of this VM. The first snapshot of this type writes the
+    /// cumulative anon baseline and arms the ledger; the base file contract
+    /// is the same as for `Incremental`.
+    SoftDirty,
 }
 
 /// Specifies the method through which guest memory will get populated when
@@ -43,8 +55,25 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory.
-    pub mem_file_path: PathBuf,
+    /// Path to the file that will contain the guest memory. Required unless
+    /// `state_only` is true; the API layer rejects the combination of a
+    /// missing path and `state_only=false` so an accidentally omitted field
+    /// cannot produce a successful but incomplete artifact.
+    pub mem_file_path: Option<PathBuf>,
+    /// When true, only the microVM state is saved and memory dumping is
+    /// fully delegated to the caller; `mem_file_path` must be omitted and
+    /// `snapshot_type` must be `Full` (no memory write or ledger transition
+    /// happens). Explicit opt-in: the default (false) preserves the upstream
+    /// contract that a create request always writes the memory file.
+    #[serde(default)]
+    pub state_only: bool,
+    /// When true, skip the fsync (`sync_all`) of the state and memory files;
+    /// the caller takes over durability (e.g. an orchestrator that fsyncs the
+    /// files before committing a manifest). The default (false) preserves the
+    /// upstream contract that a successful create request left the files
+    /// durably written.
+    #[serde(default)]
+    pub deferred_sync: bool,
 }
 
 /// Allows for changing the mapping between tap devices and host devices

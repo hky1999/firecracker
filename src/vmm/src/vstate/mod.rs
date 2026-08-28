@@ -9,8 +9,12 @@ pub mod interrupts;
 pub mod kvm;
 /// Module with GuestMemory implementation.
 pub mod memory;
+/// Pagemap-anon (KPF_ANON) incremental snapshot ledger.
+pub mod pagemap_anon;
 /// Resource manager for devices.
 pub mod resources;
+/// Soft-dirty (pagemap bit 55) incremental snapshot ledger.
+pub mod soft_dirty;
 /// Module with Vcpu implementation.
 pub mod vcpu;
 /// Module with Vm implementation.

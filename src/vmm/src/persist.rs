@@ -34,7 +34,9 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -157,6 +159,23 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Incremental snapshot requires a pre-existing base memory file: {0}
+    BaseMemoryFileMissing(std::path::PathBuf),
+    /// Base memory file {path} has size {actual}, expected {expected}
+    BaseMemoryFileSizeMismatch {
+        /// Path of the offending base file.
+        path: std::path::PathBuf,
+        /// Actual file size in bytes.
+        actual: u64,
+        /// Full guest memory size in bytes.
+        expected: u64,
+    },
+    /// Invalid create-snapshot parameter combination: {0}
+    InvalidParams(&'static str),
+    /// pagemap-anon ledger error: {0}
+    PagemapAnon(#[from] crate::vstate::pagemap_anon::PagemapAnonError),
+    /// soft-dirty ledger error: {0}
+    SoftDirty(#[from] crate::vstate::soft_dirty::SoftDirtyError),
 }
 
 /// Snapshot version
@@ -168,24 +187,62 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    // Validate before any snapshot work: the API layer rejects invalid
+    // field combinations early (friendlier errors), but
+    // `VmmAction::CreateSnapshot` can also be constructed directly by
+    // controller code and tests. A rejected request must not capture VM
+    // state or touch (truncate/overwrite) the snapshot_path file first.
+    let mem_file_path = match (params.state_only, params.mem_file_path.as_ref()) {
+        // Explicit state-only snapshot: memory dumping is fully delegated
+        // to the caller (only the state file is written).
+        (true, None) if params.snapshot_type == SnapshotType::Full => None,
+        (false, Some(path)) => Some(path),
+        (true, None) => {
+            return Err(CreateSnapshotError::InvalidParams(
+                "state_only snapshots require snapshot_type Full: no memory write or ledger transition happens",
+            ));
+        }
+        (true, Some(_)) => {
+            return Err(CreateSnapshotError::InvalidParams(
+                "mem_file_path must be omitted when state_only is true",
+            ));
+        }
+        (false, None) => {
+            return Err(CreateSnapshotError::InvalidParams(
+                "mem_file_path is required unless state_only is true",
+            ));
+        }
+    };
+
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
 
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
+    snapshot_state_to_file(&microvm_state, &params.snapshot_path, params.deferred_sync)?;
 
-    let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
-        CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
-            "snapshot requires KVM".into(),
-        ))
-    })?;
-    kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    let kvm_vm = if let Some(mem_file_path) = mem_file_path {
+        let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+            CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                "snapshot requires KVM".into(),
+            ))
+        })?;
+        kvm_vm.snapshot_memory_to_file(
+            mem_file_path,
+            params.snapshot_type,
+            params.deferred_sync,
+        )?;
+        Some(kvm_vm)
+    } else {
+        None
+    };
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
     // for queue objects.
-    vmm.device_manager
-        .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+    if let Some(kvm_vm) = kvm_vm {
+        vmm.device_manager
+            .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+    }
 
     Ok(())
 }
@@ -193,6 +250,7 @@ pub fn create_snapshot(
 fn snapshot_state_to_file(
     microvm_state: &MicrovmState,
     snapshot_path: &Path,
+    defer_sync: bool,
 ) -> Result<(), CreateSnapshotError> {
     use self::CreateSnapshotError::*;
     let mut snapshot_file = OpenOptions::new()
@@ -207,6 +265,11 @@ fn snapshot_state_to_file(
     snapshot_file
         .flush()
         .map_err(|err| SnapshotBackingFile("flush", err))?;
+    if defer_sync {
+        // Durability is delegated to the caller (e.g. an orchestrator that
+        // fsyncs the file before committing a manifest).
+        return Ok(());
+    }
     snapshot_file
         .sync_all()
         .map_err(|err| SnapshotBackingFile("sync_all", err))

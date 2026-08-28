@@ -762,6 +762,43 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /vm/dirty-memory-ranges:
+    get:
+      summary: (AKernel extension, M1-F6) Read-only preview of the armed incremental dirty window.
+      description: >
+        Returns the guest-physical ranges the next incremental snapshot would
+        write, with the ledgers' state flags. Read-only: no ledger state
+        transitions. The KVM dirty log is not exposed because reading it
+        fetch-clears the bitmap. Diagnostic cross-validation aid only.
+      operationId: getDirtyMemoryRanges
+      responses:
+        200:
+          description: Dirty window preview
+          schema:
+            type: object
+            properties:
+              armed:
+                type: boolean
+              anon_usable:
+                type: boolean
+              dirty_pages:
+                type: integer
+              total_pages:
+                type: integer
+              ranges:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    gpa:
+                      type: integer
+                    length:
+                      type: integer
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /snapshot/create:
     put:
       summary: Creates a full or diff snapshot. Post-boot only.
@@ -1607,23 +1644,47 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
       - snapshot_path
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description:
+          Path to the file that will contain the guest memory. Required
+          unless `state_only` is true; a request that omits it without
+          `state_only` is rejected.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.
+      state_only:
+        type: boolean
+        default: false
+        description:
+          When true, only the microVM state is saved and memory dumping is
+          delegated to the caller. `mem_file_path` must be omitted and
+          `snapshot_type` must be Full (state-only snapshots write no memory
+          and transition no ledger).
       snapshot_type:
         type: string
         enum:
           - Full
           - Diff
+          - Incremental
+          - SoftDirty
         description:
           Type of snapshot to create. It is optional and by default, a full
-          snapshot is created.
+          snapshot is created. Incremental and SoftDirty write only the
+          guest-written pages into the existing memory file (which must be
+          pre-created by the caller with the full guest memory size);
+          SoftDirty tracks the delta since the previous snapshot.
+      deferred_sync:
+        type: boolean
+        default: false
+        description:
+          When true, Firecracker skips the fsync of the state and memory
+          files and the caller takes over durability (e.g. an orchestrator
+          that fsyncs the files before committing a manifest). When false
+          (default), a successful create request leaves the files durably
+          written.
 
   NetworkOverride:
     type: object
