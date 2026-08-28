@@ -85,9 +85,10 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           sudo -E apt-get install -y musl-tools
-          arch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
-          cd "/usr/include/${arch}-musl"
-          sudo ln -s "../${arch}/asm" asm
+          gnu_triple="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+          musl_include="/usr/include/$(uname -m)-linux-musl"
+          cd "${musl_include}"
+          sudo ln -s "../${gnu_triple}/asm" asm
           sudo ln -s ../linux linux
           sudo ln -s ../asm-generic asm-generic
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
