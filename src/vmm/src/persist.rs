@@ -187,16 +187,11 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    let microvm_state = vmm
-        .save_state(vm_info)
-        .map_err(CreateSnapshotError::MicrovmState)?;
-
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path, params.deferred_sync)?;
-
-    // The API layer rejects invalid field combinations early (friendlier
-    // errors, no VMM state touched), but `VmmAction::CreateSnapshot` can
-    // also be constructed directly by controller code and tests — validate
-    // again here and return an error instead of panicking.
+    // Validate before any snapshot work: the API layer rejects invalid
+    // field combinations early (friendlier errors), but
+    // `VmmAction::CreateSnapshot` can also be constructed directly by
+    // controller code and tests. A rejected request must not capture VM
+    // state or touch (truncate/overwrite) the snapshot_path file first.
     let mem_file_path = match (params.state_only, params.mem_file_path.as_ref()) {
         // Explicit state-only snapshot: memory dumping is fully delegated
         // to the caller (only the state file is written).
@@ -204,7 +199,7 @@ pub fn create_snapshot(
         (false, Some(path)) => Some(path),
         (true, None) => {
             return Err(CreateSnapshotError::InvalidParams(
-                "state_only snapshots require snapshot_type Full: no memory write                  or ledger transition happens",
+                "state_only snapshots require snapshot_type Full: no memory write or ledger transition happens",
             ));
         }
         (true, Some(_)) => {
@@ -218,6 +213,12 @@ pub fn create_snapshot(
             ));
         }
     };
+
+    let microvm_state = vmm
+        .save_state(vm_info)
+        .map_err(CreateSnapshotError::MicrovmState)?;
+
+    snapshot_state_to_file(&microvm_state, &params.snapshot_path, params.deferred_sync)?;
 
     let kvm_vm = if let Some(mem_file_path) = mem_file_path {
         let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {

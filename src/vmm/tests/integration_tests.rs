@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
-use vmm::persist::{MicrovmState, MicrovmStateError, VmInfo, snapshot_state_sanity_check};
+use vmm::persist::{
+    CreateSnapshotError, MicrovmState, MicrovmStateError, VmInfo, snapshot_state_sanity_check,
+};
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
     LoadSnapshotError, PrebootApiController, RuntimeApiController, VmmAction, VmmActionError,
@@ -327,6 +329,76 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
     let vmm = preboot_api_controller.built_vmm.take().unwrap();
 
     assert_eq!(vmm.lock().unwrap().instance_info.state, VmState::Running);
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
+/// Invalid `CreateSnapshotParams` combinations constructed directly as a
+/// `VmmAction` (the non-HTTP path) must be rejected with `InvalidParams`
+/// before any snapshot work happens: no VM state capture, and the
+/// caller-provided snapshot_path file must be left byte-for-byte intact.
+#[test]
+fn test_create_snapshot_invalid_params_no_side_effects() {
+    let (vmm, _) = create_vmm(Some(NOISY_KERNEL_IMAGE), false, true, false, false);
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let mut event_manager = EventManager::new().unwrap();
+
+    thread::sleep(Duration::from_millis(100));
+    controller
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+
+    let sentinel = b"pre-existing artifact, must survive rejected requests";
+    let invalid_params = [
+        // state_only=false without mem_file_path.
+        CreateSnapshotParams {
+            snapshot_type: SnapshotType::Full,
+            snapshot_path: std::path::PathBuf::new(),
+            mem_file_path: None,
+            deferred_sync: false,
+            state_only: false,
+        },
+        // state_only=true with mem_file_path.
+        CreateSnapshotParams {
+            snapshot_type: SnapshotType::Full,
+            snapshot_path: std::path::PathBuf::new(),
+            mem_file_path: Some(std::path::PathBuf::new()),
+            deferred_sync: false,
+            state_only: true,
+        },
+        // state_only=true with an incremental type.
+        CreateSnapshotParams {
+            snapshot_type: SnapshotType::SoftDirty,
+            snapshot_path: std::path::PathBuf::new(),
+            mem_file_path: None,
+            deferred_sync: false,
+            state_only: true,
+        },
+    ];
+    for params in invalid_params {
+        let state_file = TempFile::new().unwrap();
+        std::fs::write(state_file.as_path(), sentinel).unwrap();
+        let mut params = params;
+        params.snapshot_path = state_file.as_path().to_path_buf();
+
+        let error = controller
+            .handle_request(VmmAction::CreateSnapshot(params), &mut event_manager)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VmmActionError::CreateSnapshot(CreateSnapshotError::InvalidParams(_))
+            ),
+            "expected InvalidParams, got: {error:?}"
+        );
+
+        // The rejected request must not have touched the file.
+        assert_eq!(
+            std::fs::read(state_file.as_path()).unwrap(),
+            sentinel,
+            "rejected create request modified snapshot_path"
+        );
+    }
+
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
