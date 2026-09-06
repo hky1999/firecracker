@@ -981,7 +981,7 @@ mod tests {
 
         let page_size = pagemap_anon::host_page_size();
         let count = 32;
-        let length = count * page_size as usize;
+        let length = count * usize::try_from(page_size).unwrap();
         let mut file = TempFile::new().unwrap().into_file();
         file.write_all(&vec![0x42; length]).unwrap();
         let memory = into_region_ext(
