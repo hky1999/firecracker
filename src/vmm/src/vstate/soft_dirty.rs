@@ -585,12 +585,17 @@ pub fn filter_memory_ranges_by_anon_and_soft_dirty(
                 IntersectionError::Anon(pagemap_anon::PagemapAnonError::GetHostAddressFailed)
             })?;
 
-        // Both ledgers read from /proc/self/pagemap; anon additionally
-        // consults /proc/kpageflags per present page.
-        let (anon_bitmap, _swapped) = pagemap_anon::get_anon_pages(host_addr as u64, length)
-            .map_err(IntersectionError::Anon)?;
+        // Read the window first: only dirty candidates need the per-PFN
+        // kpageflags query. Both pagemap reads and PFN permission checks
+        // remain intact. Swapped pages are included by the dirty predicate.
         let soft_dirty_bitmap =
             get_soft_dirty_pages(host_addr as u64, length).map_err(IntersectionError::SoftDirty)?;
+        let (anon_bitmap, _swapped) = pagemap_anon::get_anon_pages_with_candidates(
+            host_addr as u64,
+            length,
+            Some(&soft_dirty_bitmap),
+        )
+        .map_err(IntersectionError::Anon)?;
 
         // Swapped anonymous pages: anon=true, soft-dirty unobservable.
         // Take them (content diverges from base file).
@@ -928,6 +933,20 @@ mod tests {
 
         match filter_memory_ranges_by_anon_and_soft_dirty(&guest_memory, &full_range) {
             Ok((ranges, stats)) => {
+                // Compare with the original full-anon-then-dirty algorithm
+                // under the same clear_refs lock and unchanged mapping.
+                let (full_anon, _) =
+                    pagemap_anon::get_anon_pages(_host_addr, num_pages as u64 * page_size).unwrap();
+                let dirty = get_soft_dirty_pages(_host_addr, num_pages as u64 * page_size).unwrap();
+                let oracle: Vec<bool> = full_anon
+                    .iter()
+                    .zip(&dirty)
+                    .map(|(anon, dirty)| *anon && *dirty)
+                    .collect();
+                let (oracle_ranges, oracle_count) =
+                    pagemap_anon::coalesce_pages_to_ranges(0, &oracle, page_size);
+                assert_eq!(ranges, oracle_ranges);
+                assert_eq!(stats.dirty_pages, oracle_count);
                 // Fixture memory is MAP_PRIVATE|MAP_ANONYMOUS, so every
                 // faulted page is KPF_ANON and the intersection reduces to
                 // the soft-dirty window.
@@ -953,6 +972,63 @@ mod tests {
                 eprintln!("skipping intersection assertion: kpageflags not readable: {path}");
             }
             Err(e) => panic!("unexpected intersection error: {e}"),
+        }
+    }
+    #[test]
+    fn test_candidate_intersection_file_cow_matches_full_scan() {
+        use std::io::Write;
+        use vmm_sys_util::tempfile::TempFile;
+
+        let page_size = pagemap_anon::host_page_size();
+        let count = 32;
+        let length = count * page_size as usize;
+        let mut file = TempFile::new().unwrap().into_file();
+        file.write_all(&vec![0x42; length]).unwrap();
+        let memory = into_region_ext(
+            crate::vstate::memory::snapshot_file(
+                file,
+                [(GuestAddress(0), length)].into_iter(),
+                false,
+            )
+            .unwrap(),
+        );
+        let address = memory.get_host_address(GuestAddress(0)).unwrap() as u64;
+        // Fault in the file-backed pages without creating private copies.
+        for i in 0..count {
+            assert_eq!(
+                memory
+                    .read_obj::<u8>(GuestAddress(i as u64 * page_size))
+                    .unwrap(),
+                0x42
+            );
+        }
+        match pagemap_anon::get_anon_pages(address, length as u64) {
+            Ok(_) => {}
+            Err(pagemap_anon::PagemapAnonError::NoCapSysAdmin)
+            | Err(pagemap_anon::PagemapAnonError::OpenFailed { .. }) => {
+                eprintln!("skipping file CoW oracle: pagemap-anon permissions unavailable");
+                return;
+            }
+            Err(e) => panic!("unexpected anon probe: {e}"),
+        }
+        let _guard = clear_refs_lock().lock().unwrap();
+        for selected in [vec![], vec![1, 5, 31], (0..count).collect()] {
+            clear_soft_dirty_locked().unwrap();
+            for i in selected {
+                touch_page(&memory, i);
+            }
+            let full_range = [MemoryRange {
+                gpa: 0,
+                length: length as u64,
+            }];
+            let (got, stats) =
+                filter_memory_ranges_by_anon_and_soft_dirty(&memory, &full_range).unwrap();
+            let (anon, _) = pagemap_anon::get_anon_pages(address, length as u64).unwrap();
+            let dirty = get_soft_dirty_pages(address, length as u64).unwrap();
+            let expected: Vec<bool> = anon.iter().zip(&dirty).map(|(a, d)| *a && *d).collect();
+            let (ranges, count) = pagemap_anon::coalesce_pages_to_ranges(0, &expected, page_size);
+            assert_eq!(got, ranges);
+            assert_eq!(stats.dirty_pages, count);
         }
     }
 }

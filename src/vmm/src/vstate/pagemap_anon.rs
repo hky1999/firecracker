@@ -163,6 +163,9 @@ pub enum PagemapAnonError {
 
     /// No CAP_SYS_ADMIN permission: PFN is zero for a present page, cannot read kpageflags
     NoCapSysAdmin,
+
+    /// Candidate bitmap length does not match the number of memory pages
+    CandidateCountMismatch,
 }
 
 /// Result type for pagemap_anon operations
@@ -208,6 +211,17 @@ impl PagemapAnonStats {
 /// pages seen while scanning; those pages are `true` in the bitmap and
 /// counted separately for the stats logging.
 pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<(Vec<bool>, u64)> {
+    get_anon_pages_with_candidates(host_addr, length, None)
+}
+
+/// Query anonymous-page flags only for selected pages. The caller must
+/// intersect the result with the same candidates; swapped pages remain
+/// conservatively anonymous, as in the full scanner.
+pub(crate) fn get_anon_pages_with_candidates(
+    host_addr: u64,
+    length: u64,
+    candidates: Option<&[bool]>,
+) -> Result<(Vec<bool>, u64)> {
     let page_size = host_page_size();
     if !host_addr.is_multiple_of(page_size) {
         return Err(PagemapAnonError::NotPageAligned);
@@ -248,10 +262,35 @@ pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<(Vec<bool>, u64)> {
             source: e,
         })?;
 
+    let mut kpageflags_buf = [0u8; KPAGEFLAGS_ENTRY_SIZE];
+    classify_anon_entries(&pagemap_buf, candidates, |pfn| {
+        kpageflags_file
+            .seek(SeekFrom::Start(pfn * KPAGEFLAGS_ENTRY_SIZE as u64))
+            .map_err(|source| PagemapAnonError::SeekFailed {
+                path: "/proc/kpageflags".to_string(),
+                source,
+            })?;
+        kpageflags_file
+            .read_exact(&mut kpageflags_buf)
+            .map_err(|source| PagemapAnonError::ReadFailed {
+                path: "/proc/kpageflags".to_string(),
+                source,
+            })?;
+        Ok(u64::from_ne_bytes(kpageflags_buf))
+    })
+}
+
+fn classify_anon_entries(
+    pagemap_buf: &[u8],
+    candidates: Option<&[bool]>,
+    mut read_flags: impl FnMut(u64) -> Result<u64>,
+) -> Result<(Vec<bool>, u64)> {
+    let num_pages = pagemap_buf.len() / PAGEMAP_ENTRY_SIZE;
+    if candidates.is_some_and(|mask| mask.len() != num_pages) {
+        return Err(PagemapAnonError::CandidateCountMismatch);
+    }
     let mut result = vec![false; num_pages];
     let mut swapped_pages = 0u64;
-    let mut kpageflags_buf = [0u8; KPAGEFLAGS_ENTRY_SIZE];
-
     for (i, item) in result.iter_mut().enumerate().take(num_pages) {
         let entry_offset = i * PAGEMAP_ENTRY_SIZE;
         let entry = u64::from_ne_bytes(
@@ -283,31 +322,12 @@ pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<(Vec<bool>, u64)> {
             return Err(PagemapAnonError::NoCapSysAdmin);
         }
 
-        // Read kpageflags for this PFN
-        let kpageflags_offset = pfn * KPAGEFLAGS_ENTRY_SIZE as u64;
-        kpageflags_file
-            .seek(SeekFrom::Start(kpageflags_offset))
-            .map_err(|e| PagemapAnonError::SeekFailed {
-                path: "/proc/kpageflags".to_string(),
-                source: e,
-            })?;
-
-        kpageflags_file
-            .read_exact(&mut kpageflags_buf)
-            .map_err(|e| PagemapAnonError::ReadFailed {
-                path: "/proc/kpageflags".to_string(),
-                source: e,
-            })?;
-
-        let flags = u64::from_ne_bytes(kpageflags_buf);
-
-        // KPF_ANON (bit 12) indicates this is an anonymous page,
-        // meaning it was created by CoW when Guest wrote to it.
-        if (flags & KPF_ANON) != 0 {
-            *item = true;
+        if candidates.is_some_and(|mask| !mask[i]) {
+            continue;
         }
+        let flags = read_flags(pfn)?;
+        *item = (flags & KPF_ANON) != 0;
     }
-
     Ok((result, swapped_pages))
 }
 
@@ -484,5 +504,79 @@ mod tests {
             let got: Vec<(u64, u64)> = ranges.iter().map(|r| (r.gpa, r.length)).collect();
             assert_eq!(got, vec![(0, 4 * page_size)]);
         }
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_scan_matches_full_oracle_and_limits_queries() {
+        // Mix anonymous/file-backed, absent and swapped entries. PFNs are
+        // deliberately non-contiguous; the flags oracle does not use offsets.
+        let entries = [
+            PAGEMAP_PRESENT_BIT | 17,
+            PAGEMAP_PRESENT_BIT | 91,
+            0,
+            PAGEMAP_SWAPPED_BIT | 3,
+            PAGEMAP_PRESENT_BIT | 402,
+        ];
+        let bytes: Vec<u8> = entries.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        for bits in 0u32..32 {
+            let mask: Vec<bool> = (0..5).map(|i| bits & (1 << i) != 0).collect();
+            let mut queried = Vec::new();
+            let (got, swapped) = classify_anon_entries(&bytes, Some(&mask), |pfn| {
+                queried.push(pfn);
+                Ok(if pfn == 91 { 0 } else { KPF_ANON })
+            })
+            .unwrap();
+            let full_oracle = [true, false, false, true, true];
+            for i in 0..5 {
+                assert_eq!(got[i] && mask[i], full_oracle[i] && mask[i]);
+            }
+            assert_eq!(swapped, 1);
+            let expected_queries: Vec<u64> = [(0, 17), (1, 91), (4, 402)]
+                .into_iter()
+                .filter_map(|(i, pfn)| mask[i].then_some(pfn))
+                .collect();
+            assert_eq!(queried, expected_queries);
+        }
+        let (full, swapped) =
+            classify_anon_entries(&bytes, None, |pfn| Ok(if pfn == 91 { 0 } else { KPF_ANON }))
+                .unwrap();
+        assert_eq!(full, [true, false, false, true, true]);
+        assert_eq!(swapped, 1);
+    }
+
+    #[test]
+    fn candidates_preserve_permission_and_selected_read_errors() {
+        let hidden = PAGEMAP_PRESENT_BIT.to_ne_bytes();
+        assert!(matches!(
+            classify_anon_entries(&hidden, Some(&[false]), |_| panic!("hidden PFN")),
+            Err(PagemapAnonError::NoCapSysAdmin)
+        ));
+        let entry = (PAGEMAP_PRESENT_BIT | 7).to_ne_bytes();
+        assert!(matches!(
+            classify_anon_entries(&entry, Some(&[]), |_| panic!("invalid mask")),
+            Err(PagemapAnonError::CandidateCountMismatch)
+        ));
+        assert!(matches!(
+            classify_anon_entries(&entry, Some(&[true]), |_| Err(
+                PagemapAnonError::ReadFailed {
+                    path: "/proc/kpageflags".into(),
+                    source: io::Error::new(io::ErrorKind::UnexpectedEof, "injected short read"),
+                }
+            )),
+            Err(PagemapAnonError::ReadFailed { .. })
+        ));
+        assert_eq!(
+            classify_anon_entries(&entry, Some(&[false]), |_| panic!("clean page read")).unwrap(),
+            (vec![false], 0)
+        );
+        assert_eq!(
+            classify_anon_entries(&[], Some(&[]), |_| panic!("empty scan")).unwrap(),
+            (vec![], 0)
+        );
     }
 }
