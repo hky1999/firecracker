@@ -196,6 +196,11 @@ pub fn create_snapshot(
     // `VmmAction::CreateSnapshot` can also be constructed directly by
     // controller code and tests. A rejected request must not capture VM
     // state or touch (truncate/overwrite) the snapshot_path file first.
+    if params.sparse_full && (params.state_only || params.snapshot_type != SnapshotType::Full) {
+        return Err(CreateSnapshotError::InvalidParams(
+            "sparse_full requires a Full memory snapshot",
+        ));
+    }
     let mem_file_path = match (params.state_only, params.mem_file_path.as_ref()) {
         // Explicit state-only snapshot: memory dumping is fully delegated
         // to the caller (only the state file is written).

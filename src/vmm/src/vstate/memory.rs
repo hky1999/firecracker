@@ -41,6 +41,8 @@ pub type GuestMmapRegion = vm_memory::MmapRegion<Option<AtomicBitmap>>;
 pub enum MemoryError {
     /// Cannot dump memory: {0}
     WriteMemory(GuestMemoryError),
+    /// Cannot write or seek sparse memory output: {0}
+    SparseMemory(std::io::Error),
     /// Cannot create mmap region: {0}
     MmapRegionError(MmapRegionError),
     /// Cannot create guest memory
@@ -641,6 +643,13 @@ where
     /// Dumps all contents of GuestMemoryMmap to a writer.
     fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
 
+    /// Dumps to a new zero-filled output, skipping only verified zero bytes.
+    /// Caller must size the output first and must never pass an existing base.
+    fn dump_sparse<T: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), MemoryError>;
+
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
@@ -737,6 +746,46 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                 Ok(())
             })
             .map_err(MemoryError::WriteMemory)
+    }
+
+    fn dump_sparse<T: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), MemoryError> {
+        let mut scratch = vec![0u8; 256 * 1024];
+        for (slot, plugged) in self.iter().flat_map(|region| region.slots()) {
+            if !plugged {
+                let length =
+                    i64::try_from(slot.slice.len()).map_err(|_| MemoryError::OffsetTooLarge)?;
+                writer
+                    .seek(SeekFrom::Current(length))
+                    .map_err(MemoryError::SparseMemory)?;
+                continue;
+            }
+            for offset in (0..slot.slice.len()).step_by(scratch.len()) {
+                let length = scratch.len().min(slot.slice.len() - offset);
+                let slice = slot
+                    .slice
+                    .subslice(offset, length)
+                    .map_err(|err| MemoryError::WriteMemory(err.into()))?;
+                let bytes = &mut scratch[..length];
+                let copied = slice.copy_to(bytes);
+                if copied != length {
+                    return Err(MemoryError::SparseMemory(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "short volatile memory copy",
+                    )));
+                }
+                if bytes.iter().all(|byte| *byte == 0) {
+                    writer
+                        .seek(SeekFrom::Current(i64::try_from(length).unwrap()))
+                        .map_err(MemoryError::SparseMemory)?;
+                } else {
+                    writer.write_all(bytes).map_err(MemoryError::SparseMemory)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
@@ -1132,6 +1181,74 @@ mod tests {
 
         let actual_memory_state = guest_memory.describe();
         assert_eq!(expected_memory_state, actual_memory_state);
+    }
+
+    #[test]
+    fn test_dump_sparse_io_errors() {
+        struct Fail;
+        impl std::io::Write for Fail {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("write"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl std::io::Seek for Fail {
+            fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+                Err(std::io::Error::other("seek"))
+            }
+        }
+        let memory = into_region_ext(
+            anonymous(
+                [(GuestAddress(0), host_page_size())].into_iter(),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        memory.dump_sparse(&mut Fail).unwrap_err(); // Zero: seek fails.
+        memory.write_slice(&[1], GuestAddress(0)).unwrap();
+        memory.dump_sparse(&mut Fail).unwrap_err(); // Nonzero: write fails.
+    }
+
+    #[test]
+    fn test_dump_sparse_oracle() {
+        use std::io::Cursor;
+        // Both regions include short final chunks, with a guest address gap.
+        let size = 256 * 1024 + host_page_size();
+        for pattern in [0u8, 1, 2] {
+            let memory = into_region_ext(
+                anonymous(
+                    [
+                        (GuestAddress(0), size),
+                        (GuestAddress((size * 2) as u64), size),
+                    ]
+                    .into_iter(),
+                    true,
+                    HugePageConfig::None,
+                )
+                .unwrap(),
+            );
+            for (i, region) in memory.iter().enumerate() {
+                let mut data = vec![0; size];
+                if pattern == 1 {
+                    data.fill(0xAB);
+                }
+                if pattern == 2 {
+                    data[0] = 0x19;
+                    data[256 * 1024 - 1] = 0x55;
+                    data[size - 1] = u8::try_from(i + 1).unwrap();
+                }
+                memory.write_slice(&data, region.start_addr()).unwrap();
+            }
+            let mut dense_bytes = vec![0u8; size * 2];
+            let mut dense = Cursor::new(dense_bytes.as_mut_slice());
+            let mut sparse = Cursor::new(vec![0u8; size * 2]);
+            memory.dump(&mut dense).unwrap();
+            memory.dump_sparse(&mut sparse).unwrap();
+            assert_eq!(dense.into_inner(), sparse.into_inner());
+        }
     }
 
     #[test]
@@ -1732,6 +1849,29 @@ mod tests {
                 kvm_bitmap,
                 total_size,
             )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+            #[test]
+            fn dump_sparse_layout_oracle(
+                specs in proptest::collection::vec(region_spec(), 1..=3),
+            ) {
+                let (memory, _, total) = build_memory(&specs);
+                for region in memory.iter() {
+                    let mut data = vec![0u8; u64_to_usize(region.len())];
+                    for (idx, byte) in data.iter_mut().enumerate() {
+                        if idx % 8192 < 4096 { *byte = 0x7A; }
+                    }
+                    memory.write_slice(&data, region.start_addr()).unwrap();
+                }
+                let mut dense_bytes = vec![0u8; total];
+                let mut dense = std::io::Cursor::new(dense_bytes.as_mut_slice());
+                let mut sparse = std::io::Cursor::new(vec![0u8; total]);
+                memory.dump(&mut dense).unwrap();
+                memory.dump_sparse(&mut sparse).unwrap();
+                prop_assert_eq!(dense.into_inner(), sparse.into_inner());
+            }
         }
 
         proptest! {

@@ -1739,6 +1739,10 @@ definitions:
           guest-written pages into the existing memory file (which must be
           pre-created by the caller with the full guest memory size);
           SoftDirty tracks the delta since the previous snapshot.
+      sparse_full:
+        type: boolean
+        default: false
+        description: Experimental Full memory dump that skips verified zero blocks. Requires Full, state_only=false, and a new memory file. Existing targets are rejected through exclusive creation.
       deferred_sync:
         type: boolean
         default: false

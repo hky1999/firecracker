@@ -587,6 +587,10 @@ impl KvmVm {
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
+        if sparse_full && snapshot_type != SnapshotType::Full {
+            return Err(InvalidParams("sparse_full requires Full"));
+        }
+
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
 
@@ -606,6 +610,7 @@ impl KvmVm {
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
+            .create_new(sparse_full)
             .truncate(false)
             .open(mem_file_path)
             .map_err(|err| MemoryBackingFile("open", err))?;
@@ -664,7 +669,11 @@ impl KvmVm {
                 .map_err(|e| MemoryBackingFile("write_all_at", e))?;
             }
             SnapshotType::Full => {
-                self.guest_memory().dump(&mut file)?;
+                if sparse_full {
+                    self.guest_memory().dump_sparse(&mut file)?;
+                } else {
+                    self.guest_memory().dump(&mut file)?;
+                }
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
                 if include_kvm_dirty {
@@ -1388,6 +1397,41 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(mem_size);
         vm.register_dram_memory_regions(gm).unwrap();
         vm
+    }
+
+    #[test]
+    fn test_sparse_full_snapshot_file() {
+        use std::os::unix::fs::MetadataExt;
+        use vmm_sys_util::tempfile::TempFile;
+        let vm = setup_vm_with_memory(2 * 1024 * 1024);
+        vm.guest_memory()
+            .write_slice(&[0xA7], GuestAddress(4099))
+            .unwrap();
+        let dense = TempFile::new().unwrap();
+        vm.snapshot_memory_to_file(dense.as_path(), SnapshotType::Full, false, false)
+            .unwrap();
+        let sparse = TempFile::new().unwrap();
+        // Reject an existing target without altering it, including a symlink.
+        std::fs::write(sparse.as_path(), b"preserve").unwrap();
+        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true)
+            .unwrap_err();
+        assert_eq!(std::fs::read(sparse.as_path()).unwrap(), b"preserve");
+        std::fs::remove_file(sparse.as_path()).unwrap();
+        std::os::unix::fs::symlink(dense.as_path(), sparse.as_path()).unwrap();
+        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true)
+            .unwrap_err();
+        std::fs::remove_file(sparse.as_path()).unwrap();
+        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dense.as_path()).unwrap(),
+            std::fs::read(sparse.as_path()).unwrap()
+        );
+        let metadata = std::fs::metadata(sparse.as_path()).unwrap();
+        assert_eq!(metadata.len(), 2 * 1024 * 1024);
+        assert!(metadata.blocks() * 512 < metadata.len());
+        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::SoftDirty, false, true)
+            .unwrap_err();
     }
 
     #[test]

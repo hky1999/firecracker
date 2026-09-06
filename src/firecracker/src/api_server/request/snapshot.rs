@@ -62,6 +62,14 @@ pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, Request
 fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
 
+    if snapshot_config.sparse_full
+        && (snapshot_config.state_only || snapshot_config.snapshot_type != SnapshotType::Full)
+    {
+        return Err(RequestError::SerdeJson(serde_json::Error::custom(
+            "sparse_full requires a Full memory snapshot",
+        )));
+    }
+
     // A create request must either write the memory file or explicitly opt
     // into a state-only snapshot; an accidentally omitted `mem_file_path`
     // must stay an error (the pre-fork contract) instead of silently
@@ -185,6 +193,21 @@ mod tests {
 
     use super::*;
     use crate::api_server::parsed_request::tests::{depr_action_from_req, vmm_action_from_request};
+
+    #[test]
+    fn test_sparse_full_create_parameters() {
+        parse_put_snapshot_create(&Body::new(
+            r#"{"snapshot_path":"s","mem_file_path":"m","sparse_full":true}"#,
+        ))
+        .unwrap();
+        for body in [
+            r#"{"snapshot_path":"s","mem_file_path":"m","snapshot_type":"Diff","sparse_full":true}"#,
+            r#"{"snapshot_path":"s","mem_file_path":"m","snapshot_type":"SoftDirty","sparse_full":true}"#,
+            r#"{"snapshot_path":"s","state_only":true,"sparse_full":true}"#,
+        ] {
+            parse_put_snapshot_create(&Body::new(body)).unwrap_err();
+        }
+    }
 
     #[test]
     fn test_parse_put_snapshot() {
