@@ -27,7 +27,7 @@ use vmm_sys_util::terminal::Terminal;
 
 use crate::arch::{GSI_MSI_END, host_page_size};
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
-use crate::logger::{debug, info};
+use crate::logger::{debug, info, warn};
 use crate::persist::CreateSnapshotError;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::bus::Bus;
@@ -705,13 +705,31 @@ impl KvmVm {
 
         file.flush()
             .map_err(|err| MemoryBackingFile("flush", err))?;
-        if defer_sync {
-            // Durability is delegated to the caller (e.g. an orchestrator
-            // that fsyncs the file before committing a manifest).
-            return Ok(());
+        if !defer_sync {
+            file.sync_all()
+                .map_err(|err| MemoryBackingFile("sync_all", err))?;
         }
-        file.sync_all()
-            .map_err(|err| MemoryBackingFile("sync_all", err))
+        if snapshot_type == SnapshotType::Full {
+            // The caller keeps the guest paused throughout this operation.
+            // The complete image is now written (and synced unless durability
+            // was delegated). Open a new window so the next SoftDirty snapshot
+            // need not rewrite the cumulative anonymous baseline. An existing
+            // window must also be reset to this newer Full image.
+            let accounting = &self.common.soft_dirty_accounting;
+            let rearm = if accounting.is_armed() {
+                accounting.ack_persisted()
+            } else {
+                accounting.arm().map(|_| ())
+            };
+            if let Err(err) = rearm {
+                // Tracking is an optimization, not a prerequisite for Full.
+                // Never leave a failed window armed: the next incremental
+                // request must use the cumulative baseline or fail safely.
+                accounting.disarm();
+                warn!("Full snapshot complete, soft-dirty window unavailable: {err}");
+            }
+        }
+        Ok(())
     }
 
     /// Writes the ledger-selected pages of guest memory into the existing
@@ -1397,6 +1415,135 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(mem_size);
         vm.register_dram_memory_regions(gm).unwrap();
         vm
+    }
+
+    // clear_refs is process-wide. Run complete windows in a fresh test
+    // process so parallel tests cannot clear this fixture's pending writes.
+    fn full_window_probe_child(name: &str) -> bool {
+        const CHILD: &str = "FC_TEST_FULL_WINDOW_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated window test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        true
+    }
+
+    #[test]
+    fn test_full_then_softdirty_window_probe() {
+        if full_window_probe_child("vstate::vm::tests::test_full_then_softdirty_window_probe") {
+            return;
+        }
+        use vmm_sys_util::tempfile::TempFile;
+        fn wchar() -> u64 {
+            std::fs::read_to_string("/proc/self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("wchar: "))
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+        let size = 32 * 1024 * 1024;
+        let vm = setup_vm_with_memory(size);
+        let mut expected = vec![0x51; size];
+        vm.guest_memory()
+            .write_slice(&expected, GuestAddress(0))
+            .unwrap();
+        let full = TempFile::new().unwrap();
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, false)
+            .unwrap();
+        let armed_after_full = vm.common.soft_dirty_accounting.is_armed();
+        assert!(
+            armed_after_full,
+            "Full must establish the next delta window"
+        );
+        let delta = TempFile::new().unwrap();
+        std::fs::copy(full.as_path(), delta.as_path()).unwrap();
+        expected[3 * 4096 + 19] = 0x7E;
+        vm.guest_memory()
+            .write_slice(&[0x7E], GuestAddress(3 * 4096 + 19))
+            .unwrap();
+        let before = wchar();
+        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, false)
+            .unwrap();
+        let written = wchar() - before;
+        assert_eq!(std::fs::read(delta.as_path()).unwrap(), expected);
+        println!(
+            "full_window_probe armed_after_full={} wchar_delta={} logical_bytes={} armed_after_delta={}",
+            armed_after_full,
+            written,
+            size,
+            vm.common.soft_dirty_accounting.is_armed()
+        );
+        assert!(
+            (4096..8192).contains(&written),
+            "single-page delta was amplified: {written}"
+        );
+    }
+
+    #[test]
+    fn test_full_reopens_window_and_failed_full_preserves_it() {
+        if full_window_probe_child(
+            "vstate::vm::tests::test_full_reopens_window_and_failed_full_preserves_it",
+        ) {
+            return;
+        }
+        use vmm_sys_util::tempfile::TempFile;
+        fn wchar() -> u64 {
+            std::fs::read_to_string("/proc/self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("wchar: "))
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+        let size = 8 * 1024 * 1024;
+        let vm = setup_vm_with_memory(size);
+        let mut expected = vec![0x41; size];
+        vm.guest_memory()
+            .write_slice(&expected, GuestAddress(0))
+            .unwrap();
+        let full = TempFile::new().unwrap();
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, false, false)
+            .unwrap();
+        expected[4099] = 0xA1;
+        vm.guest_memory()
+            .write_slice(&[0xA1], GuestAddress(4099))
+            .unwrap();
+        // This write belongs to the newer Full, not its following delta.
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, false)
+            .unwrap();
+        expected[3 * 4096 + 11] = 0xB2;
+        vm.guest_memory()
+            .write_slice(&[0xB2], GuestAddress(3 * 4096 + 11))
+            .unwrap();
+        // A rejected sparse Full must not reset the pending dirty window.
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, true)
+            .unwrap_err();
+        let delta = TempFile::new().unwrap();
+        std::fs::copy(full.as_path(), delta.as_path()).unwrap();
+        let before = wchar();
+        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, false)
+            .unwrap();
+        let written = wchar() - before;
+        assert_eq!(std::fs::read(delta.as_path()).unwrap(), expected);
+        assert!(
+            (4096..8192).contains(&written),
+            "Full did not reset the old window: {written}"
+        );
+        println!("repeated_full_window_probe wchar_delta={written}");
     }
 
     #[test]
