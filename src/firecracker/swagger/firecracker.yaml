@@ -1739,6 +1739,10 @@ definitions:
           guest-written pages into the existing memory file (which must be
           pre-created by the caller with the full guest memory size);
           SoftDirty tracks the delta since the previous snapshot.
+      skip_unchanged:
+        type: boolean
+        default: false
+        description: Experimental Incremental/SoftDirty filter that compares against the readable complete base and skips equal bytes. Invalid for Full, Diff or state_only. Durability and lineage rules are unchanged.
       sparse_full:
         type: boolean
         default: false

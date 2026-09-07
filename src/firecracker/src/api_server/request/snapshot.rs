@@ -70,6 +70,18 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
         )));
     }
 
+    if snapshot_config.skip_unchanged
+        && (snapshot_config.state_only
+            || !matches!(
+                snapshot_config.snapshot_type,
+                SnapshotType::Incremental | SnapshotType::SoftDirty
+            ))
+    {
+        return Err(RequestError::SerdeJson(serde_json::Error::custom(
+            "skip_unchanged requires an incremental memory snapshot",
+        )));
+    }
+
     // A create request must either write the memory file or explicitly opt
     // into a state-only snapshot; an accidentally omitted `mem_file_path`
     // must stay an error (the pre-fork contract) instead of silently
@@ -193,6 +205,23 @@ mod tests {
 
     use super::*;
     use crate::api_server::parsed_request::tests::{depr_action_from_req, vmm_action_from_request};
+
+    #[test]
+    fn test_skip_unchanged_create_parameters() {
+        for kind in ["Incremental", "SoftDirty"] {
+            let body = format!(
+                r#"{{"snapshot_path":"s","mem_file_path":"m","snapshot_type":"{kind}","skip_unchanged":true}}"#
+            );
+            parse_put_snapshot_create(&Body::new(body)).unwrap();
+        }
+        for body in [
+            r#"{"snapshot_path":"s","mem_file_path":"m","skip_unchanged":true}"#,
+            r#"{"snapshot_path":"s","mem_file_path":"m","snapshot_type":"Diff","skip_unchanged":true}"#,
+            r#"{"snapshot_path":"s","state_only":true,"skip_unchanged":true}"#,
+        ] {
+            parse_put_snapshot_create(&Body::new(body)).unwrap_err();
+        }
+    }
 
     #[test]
     fn test_sparse_full_create_parameters() {

@@ -591,6 +591,15 @@ impl KvmVm {
             return Err(InvalidParams("sparse_full requires Full"));
         }
 
+        if skip_unchanged
+            && !matches!(
+                snapshot_type,
+                SnapshotType::Incremental | SnapshotType::SoftDirty
+            )
+        {
+            return Err(InvalidParams("skip_unchanged requires incremental memory"));
+        }
+
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
 
@@ -608,6 +617,7 @@ impl KvmVm {
         }
 
         let mut file = OpenOptions::new()
+            .read(skip_unchanged)
             .write(true)
             .create(true)
             .create_new(sparse_full)
@@ -788,7 +798,7 @@ impl KvmVm {
                     stats.anon_pages,
                     stats.total_pages
                 );
-                write_ranges_at_offsets(guest_memory, &mappings, file, &ranges)
+                write_ranges_at_offsets(guest_memory, &mappings, file, &ranges, skip_unchanged)
                     .map_err(|e| MemoryBackingFile("write_all_at", e))?;
                 // Baseline written; arm for the next snapshot, exactly like
                 // the SoftDirty first window below. Both modes write the same
@@ -855,8 +865,13 @@ impl KvmVm {
                         stats.dirty_pages,
                         stats.total_pages
                     );
-                    if let Err(e) = write_ranges_at_offsets(guest_memory, &mappings, file, &ranges)
-                    {
+                    if let Err(e) = write_ranges_at_offsets(
+                        guest_memory,
+                        &mappings,
+                        file,
+                        &ranges,
+                        skip_unchanged,
+                    ) {
                         accounting.disarm();
                         return Err(MemoryBackingFile("write_all_at", e));
                     }
@@ -919,7 +934,7 @@ impl KvmVm {
                         stats.anon_pages,
                         stats.total_pages
                     );
-                    write_ranges_at_offsets(guest_memory, &mappings, file, &ranges)
+                    write_ranges_at_offsets(guest_memory, &mappings, file, &ranges, skip_unchanged)
                         .map_err(|e| MemoryBackingFile("write_all_at", e))?;
                     let t_arm = std::time::Instant::now();
                     // Baseline written; arm for the next snapshot (durability
@@ -1235,6 +1250,51 @@ fn memory_file_mappings(guest_memory: &GuestMemoryMmap) -> Vec<RegionFileMapping
     mappings
 }
 
+/// Compare against a stable complete base with a bounded reusable buffer.
+fn write_changed_bytes(
+    file: &File,
+    offset: u64,
+    bytes: &[u8],
+    scratch: &mut [u8],
+) -> io::Result<u64> {
+    use std::os::unix::fs::FileExt;
+
+    if scratch.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty comparison buffer",
+        ));
+    }
+    let mut written = 0;
+    for (index, block) in bytes.chunks(scratch.len()).enumerate() {
+        let block_offset = offset + (index * scratch.len()) as u64;
+        let previous = &mut scratch[..block.len()];
+        // A read error cannot authorize skipping bytes. Keep the same failure
+        // and lineage invalidation path as a failed snapshot write.
+        file.read_exact_at(previous, block_offset)?;
+        if block == previous {
+            continue;
+        }
+        // 4KiB is a comparison granule, not an assumption about host PTE size.
+        // Coalesce adjacent changed granules, including any partial final one.
+        let mut start = None;
+        for (page, (new, old)) in block.chunks(4096).zip(previous.chunks(4096)).enumerate() {
+            let pos = page * 4096;
+            if new != old {
+                start.get_or_insert(pos);
+            } else if let Some(begin) = start.take() {
+                file.write_all_at(&block[begin..pos], block_offset + begin as u64)?;
+                written += (pos - begin) as u64;
+            }
+        }
+        if let Some(begin) = start {
+            file.write_all_at(&block[begin..], block_offset + begin as u64)?;
+            written += (block.len() - begin) as u64;
+        }
+    }
+    Ok(written)
+}
+
 /// Writes the given guest-physical `ranges` into `file` at their mapped
 /// offsets (`pwrite` semantics: the file cursor is untouched, holes between
 /// ranges keep their previous content). Returns the number of bytes written.
@@ -1243,10 +1303,17 @@ fn write_ranges_at_offsets(
     mappings: &[RegionFileMapping],
     file: &mut File,
     ranges: &[MemoryRange],
+    skip_unchanged: bool,
 ) -> io::Result<u64> {
     use std::os::unix::fs::FileExt;
 
     let mut written = 0u64;
+    let mut compared = 0u64;
+    let mut scratch = if skip_unchanged {
+        vec![0u8; 256 * 1024]
+    } else {
+        Vec::new()
+    };
     for range in ranges {
         let mut gpa = range.gpa;
         let mut remaining = range.length;
@@ -1278,12 +1345,26 @@ fn write_ranges_at_offsets(
                     usize::try_from(chunk).expect("chunk must fit in usize"),
                 )
             };
-            file.write_all_at(buf, mapping.file_offset + (gpa - mapping.gpa))?;
+            let offset = mapping.file_offset + (gpa - mapping.gpa);
+            if skip_unchanged {
+                written += write_changed_bytes(file, offset, buf, &mut scratch)?;
+                compared += chunk;
+            } else {
+                file.write_all_at(buf, offset)?;
+                written += chunk;
+            }
 
             gpa += chunk;
             remaining -= chunk;
-            written += chunk;
         }
+    }
+    if skip_unchanged {
+        info!(
+            "Incremental content filter: compared={} bytes written={} bytes skipped={} bytes",
+            compared,
+            written,
+            compared - written
+        );
     }
     Ok(written)
 }
@@ -1336,6 +1417,81 @@ pub(crate) mod tests {
     /// Ranges written through the mapping table must land at the packed
     /// region offsets, and bytes outside the ranges must stay untouched.
     #[test]
+    fn test_incremental_content_filter() {
+        if full_window_probe_child("vstate::vm::tests::test_incremental_content_filter") {
+            return;
+        }
+        use std::os::unix::fs::FileExt;
+        use vmm_sys_util::tempfile::TempFile;
+        fn wchar() -> u64 {
+            std::fs::read_to_string("/proc/self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("wchar: "))
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+        let length = 3 * 256 * 1024 + 37;
+        let offset = 123;
+        for mode in ["equal", "partial", "all", "zero"] {
+            let base = if mode == "zero" { 0 } else { 0x51 };
+            let original = vec![base; length + offset + 53];
+            let target = TempFile::new().unwrap();
+            let file = target.as_file();
+            if mode == "zero" {
+                file.set_len(original.len() as u64).unwrap();
+            } else {
+                file.write_all_at(&original, 0).unwrap();
+            }
+            let mut bytes = vec![base; length];
+            let expected_written = match mode {
+                "partial" => {
+                    for pos in [
+                        3,
+                        4096 + 7,
+                        256 * 1024 - 1,
+                        256 * 1024 + 3,
+                        2 * 256 * 1024 + 17,
+                        length - 1,
+                    ] {
+                        bytes[pos] = 0xA9;
+                    }
+                    5 * 4096 + 37
+                }
+                "all" => {
+                    bytes.fill(0xA9);
+                    length
+                }
+                _ => 0,
+            };
+            let mut scratch = vec![0; 256 * 1024];
+            let before = wchar();
+            let written = write_changed_bytes(file, offset as u64, &bytes, &mut scratch).unwrap();
+            let actual = wchar() - before;
+            assert_eq!(written, expected_written as u64, "{mode}");
+            assert_eq!(actual, written, "actual syscall bytes: {mode}");
+            let mut expected = original;
+            expected[offset..offset + length].copy_from_slice(&bytes);
+            assert_eq!(std::fs::read(target.as_path()).unwrap(), expected);
+            assert_eq!(
+                write_changed_bytes(file, offset as u64, &bytes, &mut scratch).unwrap(),
+                0
+            );
+            println!(
+                "content_filter mode={mode} candidate={length} written={written} wchar={actual}"
+            );
+        }
+        let short = TempFile::new().unwrap();
+        let mut scratch = vec![0; 4096];
+        write_changed_bytes(short.as_file(), 0, &[1; 4096], &mut scratch).unwrap_err();
+        short.as_file().set_len(4096).unwrap();
+        let readonly = File::open(short.as_path()).unwrap();
+        write_changed_bytes(&readonly, 0, &[1; 4096], &mut scratch).unwrap_err();
+        assert_eq!(std::fs::read(short.as_path()).unwrap(), vec![0; 4096]);
+    }
+
+    #[test]
     fn test_write_ranges_at_offsets_pwrite_semantics() {
         use std::io::{Read, Seek, SeekFrom};
 
@@ -1373,8 +1529,12 @@ pub(crate) mod tests {
         let mut file = vmm_sys_util::tempfile::TempFile::new().unwrap().into_file();
         file.set_len(5 * page).unwrap();
         let written =
-            write_ranges_at_offsets(&guest_memory, &mappings, &mut file, &[target]).unwrap();
+            write_ranges_at_offsets(&guest_memory, &mappings, &mut file, &[target], false).unwrap();
         assert_eq!(written, page);
+        assert_eq!(
+            write_ranges_at_offsets(&guest_memory, &mappings, &mut file, &[target], true).unwrap(),
+            0
+        );
 
         // Verify qword-exactly: the target page (region1's 2-page file span
         // comes first, so region2's middle page lands at file offset 3*page)
@@ -1440,6 +1600,61 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_skip_unchanged_softdirty_window() {
+        if full_window_probe_child("vstate::vm::tests::test_skip_unchanged_softdirty_window") {
+            return;
+        }
+        use vmm_sys_util::tempfile::TempFile;
+        let size = 32 * 1024 * 1024;
+        let vm = setup_vm_with_memory(size);
+        let mut expected = vec![0x51; size];
+        vm.guest_memory()
+            .write_slice(&expected, GuestAddress(0))
+            .unwrap();
+        let full = TempFile::new().unwrap();
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, false, false)
+            .unwrap();
+        // Mark the entire mapping dirty while changing only a single byte.
+        vm.guest_memory()
+            .write_slice(&expected, GuestAddress(0))
+            .unwrap();
+        expected[4099] = 0xA9;
+        vm.guest_memory()
+            .write_slice(&[0xA9], GuestAddress(4099))
+            .unwrap();
+        let rejected = TempFile::new().unwrap();
+        vm.snapshot_memory_to_file(
+            rejected.as_path(),
+            SnapshotType::SoftDirty,
+            true,
+            false,
+            true,
+        )
+        .unwrap_err();
+        let delta = TempFile::new().unwrap();
+        std::fs::copy(full.as_path(), delta.as_path()).unwrap();
+        fn wchar() -> u64 {
+            std::fs::read_to_string("/proc/self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("wchar: "))
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+        let before = wchar();
+        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, false, true)
+            .unwrap();
+        let actual = wchar() - before;
+        assert!(
+            (4096..8192).contains(&actual),
+            "unexpected write amplification: {actual}"
+        );
+        assert_eq!(std::fs::read(delta.as_path()).unwrap(), expected);
+        println!("filtered_softdirty_window candidate={size} wchar={actual} bytes_match=true");
+    }
+
+    #[test]
     fn test_full_then_softdirty_window_probe() {
         if full_window_probe_child("vstate::vm::tests::test_full_then_softdirty_window_probe") {
             return;
@@ -1461,7 +1676,7 @@ pub(crate) mod tests {
             .write_slice(&expected, GuestAddress(0))
             .unwrap();
         let full = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, false)
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, false, false)
             .unwrap();
         let armed_after_full = vm.common.soft_dirty_accounting.is_armed();
         assert!(
@@ -1475,7 +1690,7 @@ pub(crate) mod tests {
             .write_slice(&[0x7E], GuestAddress(3 * 4096 + 19))
             .unwrap();
         let before = wchar();
-        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, false)
+        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, false, false)
             .unwrap();
         let written = wchar() - before;
         assert_eq!(std::fs::read(delta.as_path()).unwrap(), expected);
@@ -1516,26 +1731,26 @@ pub(crate) mod tests {
             .write_slice(&expected, GuestAddress(0))
             .unwrap();
         let full = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, false, false)
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, false, false, false)
             .unwrap();
         expected[4099] = 0xA1;
         vm.guest_memory()
             .write_slice(&[0xA1], GuestAddress(4099))
             .unwrap();
         // This write belongs to the newer Full, not its following delta.
-        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, false)
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, false, false)
             .unwrap();
         expected[3 * 4096 + 11] = 0xB2;
         vm.guest_memory()
             .write_slice(&[0xB2], GuestAddress(3 * 4096 + 11))
             .unwrap();
         // A rejected sparse Full must not reset the pending dirty window.
-        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, true)
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, true, false)
             .unwrap_err();
         let delta = TempFile::new().unwrap();
         std::fs::copy(full.as_path(), delta.as_path()).unwrap();
         let before = wchar();
-        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, false)
+        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, false, false)
             .unwrap();
         let written = wchar() - before;
         assert_eq!(std::fs::read(delta.as_path()).unwrap(), expected);
@@ -1555,20 +1770,20 @@ pub(crate) mod tests {
             .write_slice(&[0xA7], GuestAddress(4099))
             .unwrap();
         let dense = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(dense.as_path(), SnapshotType::Full, false, false)
+        vm.snapshot_memory_to_file(dense.as_path(), SnapshotType::Full, false, false, false)
             .unwrap();
         let sparse = TempFile::new().unwrap();
         // Reject an existing target without altering it, including a symlink.
         std::fs::write(sparse.as_path(), b"preserve").unwrap();
-        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true)
+        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true, false)
             .unwrap_err();
         assert_eq!(std::fs::read(sparse.as_path()).unwrap(), b"preserve");
         std::fs::remove_file(sparse.as_path()).unwrap();
         std::os::unix::fs::symlink(dense.as_path(), sparse.as_path()).unwrap();
-        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true)
+        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true, false)
             .unwrap_err();
         std::fs::remove_file(sparse.as_path()).unwrap();
-        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true)
+        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true, false)
             .unwrap();
         assert_eq!(
             std::fs::read(dense.as_path()).unwrap(),
@@ -1577,8 +1792,14 @@ pub(crate) mod tests {
         let metadata = std::fs::metadata(sparse.as_path()).unwrap();
         assert_eq!(metadata.len(), 2 * 1024 * 1024);
         assert!(metadata.blocks() * 512 < metadata.len());
-        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::SoftDirty, false, true)
-            .unwrap_err();
+        vm.snapshot_memory_to_file(
+            sparse.as_path(),
+            SnapshotType::SoftDirty,
+            false,
+            true,
+            false,
+        )
+        .unwrap_err();
     }
 
     #[test]

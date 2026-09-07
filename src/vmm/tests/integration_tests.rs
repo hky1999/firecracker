@@ -252,6 +252,7 @@ fn verify_create_snapshot(
         mem_file_path: Some(memory_file.as_path().to_path_buf()),
         deferred_sync: false,
         sparse_full: false,
+        skip_unchanged: false,
         state_only: false,
         fs_state_path: None,
     };
@@ -353,6 +354,16 @@ fn test_create_snapshot_invalid_params_no_side_effects() {
 
     let sentinel = b"pre-existing artifact, must survive rejected requests";
     let invalid_params = [
+        // Filtering cannot silently turn a Full into a partial image.
+        CreateSnapshotParams {
+            snapshot_type: SnapshotType::Full,
+            snapshot_path: std::path::PathBuf::new(),
+            mem_file_path: Some(std::path::PathBuf::new()),
+            deferred_sync: false,
+            sparse_full: false,
+            skip_unchanged: true,
+            state_only: false,
+        },
         // state_only=false without mem_file_path.
         CreateSnapshotParams {
             snapshot_type: SnapshotType::Full,
@@ -360,6 +371,7 @@ fn test_create_snapshot_invalid_params_no_side_effects() {
             mem_file_path: None,
             deferred_sync: false,
             sparse_full: false,
+            skip_unchanged: false,
             state_only: false,
             fs_state_path: None,
         },
@@ -370,6 +382,7 @@ fn test_create_snapshot_invalid_params_no_side_effects() {
             mem_file_path: Some(std::path::PathBuf::new()),
             deferred_sync: false,
             sparse_full: false,
+            skip_unchanged: false,
             state_only: true,
             fs_state_path: None,
         },
@@ -380,6 +393,7 @@ fn test_create_snapshot_invalid_params_no_side_effects() {
             mem_file_path: None,
             deferred_sync: false,
             sparse_full: false,
+            skip_unchanged: false,
             state_only: true,
             fs_state_path: None,
         },
@@ -462,6 +476,7 @@ fn test_incremental_snapshot_arms_soft_dirty_window() {
                 mem_file_path: Some(incremental_memory.as_path().to_path_buf()),
                 deferred_sync: false,
                 sparse_full: false,
+                skip_unchanged: false,
                 state_only: false,
                 fs_state_path: None,
             }),
@@ -521,6 +536,7 @@ fn test_incremental_snapshot_arms_soft_dirty_window() {
                 mem_file_path: Some(soft_dirty_memory.as_path().to_path_buf()),
                 deferred_sync: false,
                 sparse_full: false,
+                skip_unchanged: false,
                 state_only: false,
                 fs_state_path: None,
             }),
