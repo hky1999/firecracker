@@ -709,6 +709,21 @@ impl GuestMemoryState {
     }
 }
 
+// Inspect the owned dump buffer in words. A byte-at-a-time all() scan is
+// costly for predominantly zero RAM; slice equality also depends on libc's
+// memcmp implementation (notably the static musl build). Byte conversions
+// support unaligned buffers without unsafe loads or an endian assumption.
+fn sparse_chunk_is_zero(bytes: &[u8]) -> bool {
+    let mut chunks = bytes.chunks_exact(32);
+    chunks.all(|chunk| {
+        let a = u64::from_ne_bytes(chunk[0..8].try_into().unwrap());
+        let b = u64::from_ne_bytes(chunk[8..16].try_into().unwrap());
+        let c = u64::from_ne_bytes(chunk[16..24].try_into().unwrap());
+        let d = u64::from_ne_bytes(chunk[24..32].try_into().unwrap());
+        a | b | c | d == 0
+    }) && chunks.remainder().iter().all(|byte| *byte == 0)
+}
+
 impl GuestMemoryExtension for GuestMemoryMmap {
     /// Describes GuestMemoryMmap through a GuestMemoryState struct.
     fn describe(&self) -> GuestMemoryState {
@@ -776,7 +791,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                         "short volatile memory copy",
                     )));
                 }
-                if bytes.iter().all(|byte| *byte == 0) {
+                if sparse_chunk_is_zero(bytes) {
                     writer
                         .seek(SeekFrom::Current(i64::try_from(length).unwrap()))
                         .map_err(MemoryError::SparseMemory)?;
@@ -1210,6 +1225,25 @@ mod tests {
         memory.dump_sparse(&mut Fail).unwrap_err(); // Zero: seek fails.
         memory.write_slice(&[1], GuestAddress(0)).unwrap();
         memory.dump_sparse(&mut Fail).unwrap_err(); // Nonzero: write fails.
+    }
+
+    #[test]
+    fn test_sparse_chunk_zero_detection() {
+        for length in [0, 1, 7, 8, 15, 31, 32, 33, 63, 64, 65, 4096] {
+            for offset in 0..8 {
+                let mut allocation = vec![0u8; length + offset];
+                let bytes = &mut allocation[offset..];
+                assert!(sparse_chunk_is_zero(bytes));
+                for position in 0..length {
+                    for bit in 0..8 {
+                        bytes[position] = 1 << bit;
+                        assert!(!sparse_chunk_is_zero(bytes));
+                    }
+                    bytes[position] = 0;
+                }
+                assert!(sparse_chunk_is_zero(bytes));
+            }
+        }
     }
 
     #[test]
