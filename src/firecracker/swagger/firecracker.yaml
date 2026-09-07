@@ -1743,6 +1743,10 @@ definitions:
         type: boolean
         default: false
         description: Experimental Incremental/SoftDirty filter that compares against the readable complete base and skips equal bytes. Invalid for Full, Diff or state_only. Durability and lineage rules are unchanged.
+      verify_incremental_memory:
+        type: boolean
+        default: false
+        description: Diagnostic full plugged-RAM comparison against the resulting Incremental/SoftDirty memory image, after writes and before dirty-accounting acknowledgement. Requires readable memory output and a paused guest. A mismatch or read error fails the snapshot and invalidates incremental tracking. Invalid for Full, Diff or state_only. Adds a full RAM scan to pause time; not a performance optimization or a durability guarantee.
       sparse_full:
         type: boolean
         default: false

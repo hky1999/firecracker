@@ -212,6 +212,17 @@ pub fn create_snapshot(
             "skip_unchanged requires an incremental memory snapshot",
         ));
     }
+    if params.verify_incremental_memory
+        && (params.state_only
+            || !matches!(
+                params.snapshot_type,
+                SnapshotType::Incremental | SnapshotType::SoftDirty
+            ))
+    {
+        return Err(CreateSnapshotError::InvalidParams(
+            "verify_incremental_memory requires an incremental memory snapshot",
+        ));
+    }
     let mem_file_path = match (params.state_only, params.mem_file_path.as_ref()) {
         // Explicit state-only snapshot: memory dumping is fully delegated
         // to the caller (only the state file is written).

@@ -81,6 +81,17 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
             "skip_unchanged requires an incremental memory snapshot",
         )));
     }
+    if snapshot_config.verify_incremental_memory
+        && (snapshot_config.state_only
+            || !matches!(
+                snapshot_config.snapshot_type,
+                SnapshotType::Incremental | SnapshotType::SoftDirty
+            ))
+    {
+        return Err(RequestError::SerdeJson(serde_json::Error::custom(
+            "verify_incremental_memory requires an incremental memory snapshot",
+        )));
+    }
 
     // A create request must either write the memory file or explicitly opt
     // into a state-only snapshot; an accidentally omitted `mem_file_path`
@@ -218,6 +229,23 @@ mod tests {
             r#"{"snapshot_path":"s","mem_file_path":"m","skip_unchanged":true}"#,
             r#"{"snapshot_path":"s","mem_file_path":"m","snapshot_type":"Diff","skip_unchanged":true}"#,
             r#"{"snapshot_path":"s","state_only":true,"skip_unchanged":true}"#,
+        ] {
+            parse_put_snapshot_create(&Body::new(body)).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn test_verify_incremental_memory_create_parameters() {
+        for kind in ["Incremental", "SoftDirty"] {
+            let body = format!(
+                r#"{{"snapshot_path":"s","mem_file_path":"m","snapshot_type":"{kind}","verify_incremental_memory":true}}"#
+            );
+            parse_put_snapshot_create(&Body::new(body)).unwrap();
+        }
+        for body in [
+            r#"{"snapshot_path":"s","mem_file_path":"m","verify_incremental_memory":true}"#,
+            r#"{"snapshot_path":"s","mem_file_path":"m","snapshot_type":"Diff","verify_incremental_memory":true}"#,
+            r#"{"snapshot_path":"s","state_only":true,"verify_incremental_memory":true}"#,
         ] {
             parse_put_snapshot_create(&Body::new(body)).unwrap_err();
         }

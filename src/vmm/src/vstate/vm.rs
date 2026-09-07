@@ -600,6 +600,17 @@ impl KvmVm {
             return Err(InvalidParams("skip_unchanged requires incremental memory"));
         }
 
+        if verify_incremental_memory
+            && !matches!(
+                snapshot_type,
+                SnapshotType::Incremental | SnapshotType::SoftDirty
+            )
+        {
+            return Err(InvalidParams(
+                "verify_incremental_memory requires incremental memory",
+            ));
+        }
+
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
 
@@ -617,7 +628,7 @@ impl KvmVm {
         }
 
         let mut file = OpenOptions::new()
-            .read(skip_unchanged)
+            .read(skip_unchanged || verify_incremental_memory)
             .write(true)
             .create(true)
             .create_new(sparse_full)
@@ -798,8 +809,18 @@ impl KvmVm {
                     stats.anon_pages,
                     stats.total_pages
                 );
-                write_ranges_at_offsets(guest_memory, &mappings, file, &ranges, skip_unchanged)
-                    .map_err(|e| MemoryBackingFile("write_all_at", e))?;
+                write_ranges_and_verify(
+                    guest_memory,
+                    &mappings,
+                    file,
+                    &ranges,
+                    skip_unchanged,
+                    verify_incremental_memory,
+                )
+                .map_err(|e| {
+                    accounting.disarm();
+                    MemoryBackingFile("write_all_at or incremental audit", e)
+                })?;
                 // Baseline written; arm for the next snapshot, exactly like
                 // the SoftDirty first window below. Both modes write the same
                 // cumulative pagemap-anon set; without arming here, the next
@@ -865,12 +886,13 @@ impl KvmVm {
                         stats.dirty_pages,
                         stats.total_pages
                     );
-                    if let Err(e) = write_ranges_at_offsets(
+                    if let Err(e) = write_ranges_and_verify(
                         guest_memory,
                         &mappings,
                         file,
                         &ranges,
                         skip_unchanged,
+                        verify_incremental_memory,
                     ) {
                         accounting.disarm();
                         return Err(MemoryBackingFile("write_all_at", e));
@@ -934,8 +956,18 @@ impl KvmVm {
                         stats.anon_pages,
                         stats.total_pages
                     );
-                    write_ranges_at_offsets(guest_memory, &mappings, file, &ranges, skip_unchanged)
-                        .map_err(|e| MemoryBackingFile("write_all_at", e))?;
+                    write_ranges_and_verify(
+                        guest_memory,
+                        &mappings,
+                        file,
+                        &ranges,
+                        skip_unchanged,
+                        verify_incremental_memory,
+                    )
+                    .map_err(|e| {
+                        accounting.disarm();
+                        MemoryBackingFile("write_all_at or incremental audit", e)
+                    })?;
                     let t_arm = std::time::Instant::now();
                     // Baseline written; arm for the next snapshot (durability
                     // follows the same defer_sync contract as above). A probe
@@ -1295,6 +1327,94 @@ fn write_changed_bytes(
     Ok(written)
 }
 
+/// Compare the complete plugged RAM image while the caller keeps the guest paused.
+/// This diagnostic runs before the incremental ledger is acknowledged. It does
+/// not log guest bytes, and bounds both scratch space and mismatch reporting.
+fn verify_incremental_memory_image(
+    guest_memory: &GuestMemoryMmap,
+    file: &File,
+    ranges: &[MemoryRange],
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    let mut current = vec![0u8; 256 * 1024];
+    let mut saved = vec![0u8; current.len()];
+    let mut ordered: Vec<_> = ranges.iter().collect();
+    ordered.sort_by_key(|range| range.gpa);
+    let mut mismatched = 0u64;
+    let mut outside = 0u64;
+    let mut first = None;
+    let mut region_offset = 0u64;
+    for region in guest_memory.iter() {
+        for (slot, plugged) in region.slots() {
+            if !plugged {
+                continue;
+            }
+            let slot_offset = region_offset + slot.guest_addr.0 - region.start_addr().0;
+            for offset in (0..slot.slice.len()).step_by(current.len()) {
+                let length = current.len().min(slot.slice.len() - offset);
+                let slice = slot
+                    .slice
+                    .subslice(offset, length)
+                    .map_err(io::Error::other)?;
+                if slice.copy_to(&mut current[..length]) != length {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short audit RAM read",
+                    ));
+                }
+                file.read_exact_at(&mut saved[..length], slot_offset + offset as u64)?;
+                for (index, (live, backing)) in current[..length]
+                    .chunks(4096)
+                    .zip(saved[..length].chunks(4096))
+                    .enumerate()
+                {
+                    let Some(byte) = live.iter().zip(backing).position(|(a, b)| a != b) else {
+                        continue;
+                    };
+                    let relative = offset as u64 + (index * 4096 + byte) as u64;
+                    let gpa = slot.guest_addr.0 + relative;
+                    let position = ordered.partition_point(|range| range.gpa <= gpa);
+                    let covered = position > 0
+                        && gpa - ordered[position - 1].gpa < ordered[position - 1].length;
+                    mismatched += 1;
+                    outside += u64::from(!covered);
+                    first.get_or_insert(gpa);
+                    if mismatched <= 64 {
+                        warn!(
+                            "Incremental memory audit mismatch: gpa={gpa:#x} file_offset={:#x} in_written_ranges={covered}",
+                            slot_offset + relative
+                        );
+                    }
+                }
+            }
+        }
+        region_offset += region.len();
+    }
+    if let Some(first) = first {
+        return Err(io::Error::other(format!(
+            "incremental memory audit failed: mismatched_granules={mismatched} outside_ranges={outside} first_gpa={first:#x}"
+        )));
+    }
+    info!("Incremental memory audit passed: image_bytes={region_offset}");
+    Ok(())
+}
+
+fn write_ranges_and_verify(
+    guest_memory: &GuestMemoryMmap,
+    mappings: &[RegionFileMapping],
+    file: &mut File,
+    ranges: &[MemoryRange],
+    skip_unchanged: bool,
+    verify: bool,
+) -> io::Result<u64> {
+    let written = write_ranges_at_offsets(guest_memory, mappings, file, ranges, skip_unchanged)?;
+    if verify {
+        verify_incremental_memory_image(guest_memory, file, ranges)?;
+    }
+    Ok(written)
+}
+
 /// Writes the given guest-physical `ranges` into `file` at their mapped
 /// offsets (`pwrite` semantics: the file cursor is untouched, holes between
 /// ranges keep their previous content). Returns the number of bytes written.
@@ -1385,6 +1505,142 @@ pub(crate) mod tests {
     use crate::vmm_config::machine_config::HugePageConfig;
     use crate::vstate::kvm::Kvm;
     use crate::vstate::memory::test_utils::into_region_ext;
+
+    #[test]
+    fn test_incremental_audit_preserves_unplugged_slot_offsets() {
+        use std::os::unix::fs::FileExt;
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::vstate::memory::{
+            GuestMemoryRegionState, GuestRegionMmapExt, GuestRegionType, anonymous,
+        };
+
+        let page = 4096;
+        let base = 0x10000;
+        let raw = anonymous(
+            [(GuestAddress(base), 3 * page)].into_iter(),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let region = GuestRegionMmapExt::from_state(
+            raw,
+            &GuestMemoryRegionState {
+                base_address: base,
+                size: 3 * page,
+                region_type: GuestRegionType::Hotpluggable,
+                plugged: vec![false, true, false],
+            },
+            0,
+        )
+        .unwrap();
+        let memory = GuestMemoryMmap::from_regions(vec![region]).unwrap();
+        memory
+            .write_slice(&vec![0x51; 3 * page], GuestAddress(base))
+            .unwrap();
+        let output = TempFile::new().unwrap();
+        let file = output.as_file();
+        // Unplugged slots deliberately differ. The plugged slot must still
+        // be compared at its packed-region offset, not offset zero.
+        file.set_len((3 * page) as u64).unwrap();
+        file.write_all_at(&vec![0x51; page], page as u64).unwrap();
+        verify_incremental_memory_image(&memory, file, &[]).unwrap();
+        file.write_all_at(&[0], page as u64 + 3).unwrap();
+        let error = verify_incremental_memory_image(&memory, file, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mismatched_granules=1 outside_ranges=1")
+        );
+        assert!(error.to_string().contains("first_gpa=0x11003"));
+    }
+
+    #[test]
+    fn test_incremental_memory_audit_detects_omitted_and_in_range_bytes() {
+        use std::os::unix::fs::FileExt;
+        use vmm_sys_util::tempfile::TempFile;
+
+        let page = 4096;
+        let high = 0x10000;
+        let memory = into_region_ext(
+            crate::vstate::memory::anonymous(
+                vec![
+                    (GuestAddress(0), 3 * page),
+                    (GuestAddress(high), 2 * page + 17),
+                ]
+                .into_iter(),
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        memory
+            .write_slice(&vec![0x41; 3 * page], GuestAddress(0))
+            .unwrap();
+        memory
+            .write_slice(&vec![0x72; 2 * page + 17], GuestAddress(high))
+            .unwrap();
+        let output = TempFile::new().unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(output.as_path())
+            .unwrap();
+        file.write_all_at(&vec![0x41; 3 * page], 0).unwrap();
+        file.write_all_at(&vec![0x72; 2 * page + 17], (3 * page) as u64)
+            .unwrap();
+        verify_incremental_memory_image(&memory, &file, &[]).unwrap();
+        memory
+            .write_slice(&[0xAB], GuestAddress(page as u64 + 7))
+            .unwrap();
+        memory
+            .write_slice(&[0xCD], GuestAddress(high + (2 * page + 16) as u64))
+            .unwrap();
+        let mappings = memory_file_mappings(&memory);
+        let incomplete = [MemoryRange {
+            gpa: 0,
+            length: page as u64,
+        }];
+        // Negative control: normal writes alone cannot discover missing candidates.
+        write_ranges_and_verify(&memory, &mappings, &mut file, &incomplete, false, false).unwrap();
+        let error =
+            write_ranges_and_verify(&memory, &mappings, &mut file, &incomplete, false, true)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mismatched_granules=2 outside_ranges=2"),
+            "{error}"
+        );
+        let complete = [
+            MemoryRange {
+                gpa: 0,
+                length: (3 * page) as u64,
+            },
+            MemoryRange {
+                gpa: high,
+                length: (2 * page + 17) as u64,
+            },
+        ];
+        // An asserted range is not proof that its bytes reached the file.
+        let error = verify_incremental_memory_image(&memory, &file, &complete).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mismatched_granules=2 outside_ranges=0"),
+            "{error}"
+        );
+        write_ranges_and_verify(&memory, &mappings, &mut file, &complete, true, true).unwrap();
+        file.set_len((5 * page + 16) as u64).unwrap();
+        assert_eq!(
+            verify_incremental_memory_image(&memory, &file, &complete)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
 
     /// The GPA->file-offset table must mirror the sequential dump order:
     /// with a gap between regions, the second region's file offset skips
@@ -1600,6 +1856,87 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_incremental_audit_failure_disarms_and_full_recovers() {
+        if full_window_probe_child(
+            "vstate::vm::tests::test_incremental_audit_failure_disarms_and_full_recovers",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::FileExt;
+        use vmm_sys_util::tempfile::TempFile;
+
+        // A real KVM memory registration, without running a vCPU. No guest
+        // writes race the snapshot. The isolated process owns clear_refs.
+        let size = 4 * 1024 * 1024;
+        let vm = setup_vm_with_memory(size);
+        let mut expected = vec![0x51; size];
+        vm.guest_memory()
+            .write_slice(&expected, GuestAddress(0))
+            .unwrap();
+        let base = TempFile::new().unwrap();
+        vm.snapshot_memory_to_file(
+            base.as_path(),
+            SnapshotType::Full,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(vm.common.soft_dirty_accounting.is_armed());
+
+        // Corrupt a byte in a clean page of the base. An ordinary delta has
+        // no reason to overwrite it; full-image verification must reject it.
+        base.as_file().write_all_at(&[0], 4099).unwrap();
+        let error = vm
+            .snapshot_memory_to_file(
+                base.as_path(),
+                SnapshotType::SoftDirty,
+                true,
+                false,
+                true,
+                true,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("incremental memory audit failed"),
+            "{error}"
+        );
+        assert!(!vm.common.soft_dirty_accounting.is_armed());
+
+        // Failed targets are not reusable lineage. A Full rebuild supplies
+        // a complete image and establishes a fresh window.
+        vm.snapshot_memory_to_file(
+            base.as_path(),
+            SnapshotType::Full,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(base.as_path()).unwrap(), expected);
+        assert!(vm.common.soft_dirty_accounting.is_armed());
+        expected[8197] = 0x92;
+        vm.guest_memory()
+            .write_slice(&[0x92], GuestAddress(8197))
+            .unwrap();
+        vm.snapshot_memory_to_file(
+            base.as_path(),
+            SnapshotType::SoftDirty,
+            true,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(base.as_path()).unwrap(), expected);
+        assert!(vm.common.soft_dirty_accounting.is_armed());
+    }
+
+    #[test]
     fn test_skip_unchanged_softdirty_window() {
         if full_window_probe_child("vstate::vm::tests::test_skip_unchanged_softdirty_window") {
             return;
@@ -1612,8 +1949,15 @@ pub(crate) mod tests {
             .write_slice(&expected, GuestAddress(0))
             .unwrap();
         let full = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, false, false)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            full.as_path(),
+            SnapshotType::Full,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         // Mark the entire mapping dirty while changing only a single byte.
         vm.guest_memory()
             .write_slice(&expected, GuestAddress(0))
@@ -1629,6 +1973,7 @@ pub(crate) mod tests {
             true,
             false,
             true,
+            false,
         )
         .unwrap_err();
         let delta = TempFile::new().unwrap();
@@ -1643,8 +1988,15 @@ pub(crate) mod tests {
                 .unwrap()
         }
         let before = wchar();
-        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, false, true)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            delta.as_path(),
+            SnapshotType::SoftDirty,
+            true,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         let actual = wchar() - before;
         assert!(
             (4096..8192).contains(&actual),
@@ -1676,8 +2028,15 @@ pub(crate) mod tests {
             .write_slice(&expected, GuestAddress(0))
             .unwrap();
         let full = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, false, false)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            full.as_path(),
+            SnapshotType::Full,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         let armed_after_full = vm.common.soft_dirty_accounting.is_armed();
         assert!(
             armed_after_full,
@@ -1690,8 +2049,15 @@ pub(crate) mod tests {
             .write_slice(&[0x7E], GuestAddress(3 * 4096 + 19))
             .unwrap();
         let before = wchar();
-        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, false, false)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            delta.as_path(),
+            SnapshotType::SoftDirty,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         let written = wchar() - before;
         assert_eq!(std::fs::read(delta.as_path()).unwrap(), expected);
         println!(
@@ -1731,27 +2097,48 @@ pub(crate) mod tests {
             .write_slice(&expected, GuestAddress(0))
             .unwrap();
         let full = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, false, false, false)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            full.as_path(),
+            SnapshotType::Full,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         expected[4099] = 0xA1;
         vm.guest_memory()
             .write_slice(&[0xA1], GuestAddress(4099))
             .unwrap();
         // This write belongs to the newer Full, not its following delta.
-        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, false, false)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            full.as_path(),
+            SnapshotType::Full,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         expected[3 * 4096 + 11] = 0xB2;
         vm.guest_memory()
             .write_slice(&[0xB2], GuestAddress(3 * 4096 + 11))
             .unwrap();
         // A rejected sparse Full must not reset the pending dirty window.
-        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, true, false)
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, true, false, false)
             .unwrap_err();
         let delta = TempFile::new().unwrap();
         std::fs::copy(full.as_path(), delta.as_path()).unwrap();
         let before = wchar();
-        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, false, false)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            delta.as_path(),
+            SnapshotType::SoftDirty,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         let written = wchar() - before;
         assert_eq!(std::fs::read(delta.as_path()).unwrap(), expected);
         assert!(
@@ -1770,21 +2157,49 @@ pub(crate) mod tests {
             .write_slice(&[0xA7], GuestAddress(4099))
             .unwrap();
         let dense = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(dense.as_path(), SnapshotType::Full, false, false, false)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            dense.as_path(),
+            SnapshotType::Full,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         let sparse = TempFile::new().unwrap();
         // Reject an existing target without altering it, including a symlink.
         std::fs::write(sparse.as_path(), b"preserve").unwrap();
-        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true, false)
-            .unwrap_err();
+        vm.snapshot_memory_to_file(
+            sparse.as_path(),
+            SnapshotType::Full,
+            false,
+            true,
+            false,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(std::fs::read(sparse.as_path()).unwrap(), b"preserve");
         std::fs::remove_file(sparse.as_path()).unwrap();
         std::os::unix::fs::symlink(dense.as_path(), sparse.as_path()).unwrap();
-        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true, false)
-            .unwrap_err();
+        vm.snapshot_memory_to_file(
+            sparse.as_path(),
+            SnapshotType::Full,
+            false,
+            true,
+            false,
+            false,
+        )
+        .unwrap_err();
         std::fs::remove_file(sparse.as_path()).unwrap();
-        vm.snapshot_memory_to_file(sparse.as_path(), SnapshotType::Full, false, true, false)
-            .unwrap();
+        vm.snapshot_memory_to_file(
+            sparse.as_path(),
+            SnapshotType::Full,
+            false,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(dense.as_path()).unwrap(),
             std::fs::read(sparse.as_path()).unwrap()
@@ -1797,6 +2212,7 @@ pub(crate) mod tests {
             SnapshotType::SoftDirty,
             false,
             true,
+            false,
             false,
         )
         .unwrap_err();
