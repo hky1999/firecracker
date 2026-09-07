@@ -85,3 +85,22 @@ def test_validate_filter(seccompiler, bin_test_syscall, monkeypatch, tmp_path):
                     # if we call it with unallowed args, it should exit 159
                     # 159 = 128 (abnormal termination) + 31 (SIGSYS)
                     assert outcome.returncode == 159
+
+
+def test_incremental_content_filter_pread(
+    seccompiler, bin_test_syscall, monkeypatch, tmp_path
+):
+    """The release VMM policy must permit the incremental base comparison read."""
+    policy = json.loads(
+        Path(f"../resources/seccomp/{ARCH}-unknown-linux-musl.json").read_text(encoding="ascii")
+    )
+    monkeypatch.chdir(tmp_path)
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    seccompiler.compile(policy, split_output=True)
+    arch = seccomp.Arch.X86_64 if ARCH == "x86_64" else seccomp.Arch.AARCH64
+    syscall_id = seccomp.resolve_syscall(arch, "pread64")
+    # Zero-length arguments exercise the installed BPF without requiring a
+    # guest image; a missing rule traps even when the read would be empty.
+    for thread in policy:
+        outcome = utils.run_cmd(f"{bin_test_syscall} {thread}.bpf {syscall_id}")
+        assert outcome.returncode == (0 if thread == "vmm" else 159)
