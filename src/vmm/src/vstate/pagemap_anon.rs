@@ -122,6 +122,11 @@ const PAGEMAP_PRESENT_BIT: u64 = 1 << 63;
 /// Bit 62: page is in swap
 const PAGEMAP_SWAPPED_BIT: u64 = 1 << 62;
 
+/// Bit 61: page is file-backed or shared. A present entry with this bit
+/// clear is private anonymous per the pagemap entry itself, without needing
+/// a `/proc/kpageflags` (KPF_ANON) lookup for the PFN.
+const PAGEMAP_FILE_OR_SHARED_BIT: u64 = 1 << 61;
+
 /// Mask for PFN (bits 0-54)
 const PAGEMAP_PFN_MASK: u64 = (1 << 55) - 1;
 
@@ -325,6 +330,23 @@ fn classify_anon_entries(
         if candidates.is_some_and(|mask| !mask[i]) {
             continue;
         }
+
+        // A present, PFN-carrying, selected candidate with bit 61 clear is
+        // proven private-anonymous by this very pagemap entry. Do not consult
+        // kpageflags for it: after a cross-node PFN migration the kernel can
+        // report KPF_ANON=0 on the stale old PFN (observed on BareMetal 6.8,
+        // 64/64 pages dropped -> rc101), which would veto a candidate the
+        // pagemap has already proven private. Selecting it without the query
+        // is a deliberately conservative superset: it may over-select (e.g.
+        // shared zero-page mappings), never under-select; this fix claims
+        // safety, not a smaller candidate set.
+        if (entry & PAGEMAP_FILE_OR_SHARED_BIT) == 0 {
+            *item = true;
+            continue;
+        }
+
+        // File-backed or shared pages (bit 61 set) keep the original
+        // KPF_ANON classification path.
         let flags = read_flags(pfn)?;
         *item = (flags & KPF_ANON) != 0;
     }
@@ -459,6 +481,7 @@ mod tests {
         // Verify bit positions are correct
         assert_eq!(PAGEMAP_PRESENT_BIT, 1u64 << 63);
         assert_eq!(PAGEMAP_SWAPPED_BIT, 1u64 << 62);
+        assert_eq!(PAGEMAP_FILE_OR_SHARED_BIT, 1u64 << 61);
         assert_eq!(PAGEMAP_PFN_MASK, (1u64 << 55) - 1);
         assert_eq!(KPF_ANON, 1u64 << 12);
     }
@@ -515,12 +538,15 @@ mod candidate_tests {
     fn candidate_scan_matches_full_oracle_and_limits_queries() {
         // Mix anonymous/file-backed, absent and swapped entries. PFNs are
         // deliberately non-contiguous; the flags oracle does not use offsets.
+        // Pages 0 (private-anon, bit 61 clear) and 4 (shared-anon, bit 61 set
+        // but KPF_ANON set) must both be selected; page 1 is file-backed
+        // (bit 61 set, KPF_ANON clear) and must be dropped via the query.
         let entries = [
             PAGEMAP_PRESENT_BIT | 17,
-            PAGEMAP_PRESENT_BIT | 91,
+            PAGEMAP_PRESENT_BIT | PAGEMAP_FILE_OR_SHARED_BIT | 91,
             0,
             PAGEMAP_SWAPPED_BIT | 3,
-            PAGEMAP_PRESENT_BIT | 402,
+            PAGEMAP_PRESENT_BIT | PAGEMAP_FILE_OR_SHARED_BIT | 402,
         ];
         let bytes: Vec<u8> = entries.iter().flat_map(|v| v.to_ne_bytes()).collect();
         for bits in 0u32..32 {
@@ -536,7 +562,9 @@ mod candidate_tests {
                 assert_eq!(got[i] && mask[i], full_oracle[i] && mask[i]);
             }
             assert_eq!(swapped, 1);
-            let expected_queries: Vec<u64> = [(0, 17), (1, 91), (4, 402)]
+            // Only bit-61-set pages reach kpageflags: the private-anon entry
+            // (page 0) is selected without a query.
+            let expected_queries: Vec<u64> = [(1, 91), (4, 402)]
                 .into_iter()
                 .filter_map(|(i, pfn)| mask[i].then_some(pfn))
                 .collect();
@@ -556,7 +584,10 @@ mod candidate_tests {
             classify_anon_entries(&hidden, Some(&[false]), |_| panic!("hidden PFN")),
             Err(PagemapAnonError::NoCapSysAdmin)
         ));
-        let entry = (PAGEMAP_PRESENT_BIT | 7).to_ne_bytes();
+        // File-backed entry (bit 61 set): the selected candidate still goes
+        // through kpageflags, so read errors keep propagating; a deselected
+        // candidate suppresses the query entirely.
+        let entry = (PAGEMAP_PRESENT_BIT | PAGEMAP_FILE_OR_SHARED_BIT | 7).to_ne_bytes();
         assert!(matches!(
             classify_anon_entries(&entry, Some(&[]), |_| panic!("invalid mask")),
             Err(PagemapAnonError::CandidateCountMismatch)
@@ -578,5 +609,52 @@ mod candidate_tests {
             classify_anon_entries(&[], Some(&[]), |_| panic!("empty scan")).unwrap(),
             (vec![], 0)
         );
+    }
+
+    /// Regression for the cross-node PFN migration observation (BareMetal 6.8,
+    /// evidence 20260909T0200): after a node0->node1 migration the stale old
+    /// PFN reports KPF_ANON=0 in kpageflags while the pagemap entry still
+    /// proves a private page (bit 61 clear). Replaying those observations
+    /// against the old classifier dropped all 64 pages (rc101).
+    #[test]
+    fn private_anon_entries_survive_stale_kpageflags_without_query() {
+        let entries = [
+            PAGEMAP_PRESENT_BIT | 1234,
+            PAGEMAP_PRESENT_BIT | 5678,
+            PAGEMAP_SWAPPED_BIT | 9,
+        ];
+        let bytes: Vec<u8> = entries.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let mut queries = 0u32;
+        let (got, swapped) = classify_anon_entries(&bytes, Some(&[true, true, true]), |_| {
+            queries += 1;
+            // Stale post-migration kpageflags: ANON bit clear.
+            Ok(0)
+        })
+        .unwrap();
+        // Both private-anon pages are retained despite the stale flags, the
+        // swapped page stays selected, and kpageflags is never consulted.
+        assert_eq!(got, vec![true, true, true]);
+        assert_eq!(swapped, 1);
+        assert_eq!(queries, 0);
+    }
+
+    /// File-backed/shared entries (bit 61 set) keep the kpageflags path and
+    /// are classified by KPF_ANON in both directions.
+    #[test]
+    fn file_or_shared_entries_still_classified_by_kpageflags() {
+        let entries = [
+            PAGEMAP_PRESENT_BIT | PAGEMAP_FILE_OR_SHARED_BIT | 42,
+            PAGEMAP_PRESENT_BIT | PAGEMAP_FILE_OR_SHARED_BIT | 43,
+        ];
+        let bytes: Vec<u8> = entries.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let mut queried = Vec::new();
+        let (got, swapped) = classify_anon_entries(&bytes, Some(&[true, true]), |pfn| {
+            queried.push(pfn);
+            Ok(if pfn == 42 { 0 } else { KPF_ANON })
+        })
+        .unwrap();
+        assert_eq!(got, vec![false, true]);
+        assert_eq!(swapped, 0);
+        assert_eq!(queried, vec![42, 43]);
     }
 }
