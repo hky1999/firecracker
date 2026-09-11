@@ -196,33 +196,6 @@ pub fn create_snapshot(
     // `VmmAction::CreateSnapshot` can also be constructed directly by
     // controller code and tests. A rejected request must not capture VM
     // state or touch (truncate/overwrite) the snapshot_path file first.
-    if params.sparse_full && (params.state_only || params.snapshot_type != SnapshotType::Full) {
-        return Err(CreateSnapshotError::InvalidParams(
-            "sparse_full requires a Full memory snapshot",
-        ));
-    }
-    if params.skip_unchanged
-        && (params.state_only
-            || !matches!(
-                params.snapshot_type,
-                SnapshotType::Incremental | SnapshotType::SoftDirty
-            ))
-    {
-        return Err(CreateSnapshotError::InvalidParams(
-            "skip_unchanged requires an incremental memory snapshot",
-        ));
-    }
-    if params.verify_incremental_memory
-        && (params.state_only
-            || !matches!(
-                params.snapshot_type,
-                SnapshotType::Incremental | SnapshotType::SoftDirty
-            ))
-    {
-        return Err(CreateSnapshotError::InvalidParams(
-            "verify_incremental_memory requires an incremental memory snapshot",
-        ));
-    }
     let mem_file_path = match (params.state_only, params.mem_file_path.as_ref()) {
         // Explicit state-only snapshot: memory dumping is fully delegated
         // to the caller (only the state file is written).
@@ -767,13 +740,7 @@ fn guest_memory_from_shared_file(
     const FICLONE: libc::c_ulong = 0x4004_9409;
     // SAFETY: both descriptors are valid regular files and the ioctl only
     // clones extents from the read-only source into the newly created target.
-    let result = unsafe {
-        libc::ioctl(
-            live.as_raw_fd(),
-            FICLONE.try_into().unwrap(),
-            source.as_raw_fd(),
-        )
-    };
+    let result = unsafe { libc::ioctl(live.as_raw_fd(), FICLONE, source.as_raw_fd()) };
     if result != 0 {
         // Reflink is the fast path, not a correctness requirement. A new
         // independent live file is still safe on filesystems without

@@ -587,30 +587,6 @@ impl KvmVm {
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
-        if sparse_full && snapshot_type != SnapshotType::Full {
-            return Err(InvalidParams("sparse_full requires Full"));
-        }
-
-        if skip_unchanged
-            && !matches!(
-                snapshot_type,
-                SnapshotType::Incremental | SnapshotType::SoftDirty
-            )
-        {
-            return Err(InvalidParams("skip_unchanged requires incremental memory"));
-        }
-
-        if verify_incremental_memory
-            && !matches!(
-                snapshot_type,
-                SnapshotType::Incremental | SnapshotType::SoftDirty
-            )
-        {
-            return Err(InvalidParams(
-                "verify_incremental_memory requires incremental memory",
-            ));
-        }
-
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
 
@@ -628,10 +604,9 @@ impl KvmVm {
         }
 
         let mut file = OpenOptions::new()
-            .read(skip_unchanged || verify_incremental_memory)
+            .read(true)
             .write(true)
             .create(true)
-            .create_new(sparse_full)
             .truncate(false)
             .open(mem_file_path)
             .map_err(|err| MemoryBackingFile("open", err))?;
@@ -680,21 +655,9 @@ impl KvmVm {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
-                let mappings = memory_file_mappings(self.guest_memory());
-                write_ranges_at_offsets(
-                    self.guest_memory(),
-                    &mappings,
-                    &mut file,
-                    external_dirty_ranges,
-                )
-                .map_err(|e| MemoryBackingFile("write_all_at", e))?;
             }
             SnapshotType::Full => {
-                if sparse_full {
-                    self.guest_memory().dump_sparse(&mut file)?;
-                } else {
-                    self.guest_memory().dump(&mut file)?;
-                }
+                self.guest_memory().dump(&mut file)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
                 if include_kvm_dirty {
@@ -809,18 +772,11 @@ impl KvmVm {
                     stats.anon_pages,
                     stats.total_pages
                 );
-                write_ranges_and_verify(
-                    guest_memory,
-                    &mappings,
-                    file,
-                    &ranges,
-                    skip_unchanged,
-                    verify_incremental_memory,
-                )
-                .map_err(|e| {
-                    accounting.disarm();
-                    MemoryBackingFile("write_all_at or incremental audit", e)
-                })?;
+                write_ranges_and_verify(guest_memory, &mappings, file, &ranges, false, false)
+                    .map_err(|e| {
+                        accounting.disarm();
+                        MemoryBackingFile("write_all_at or incremental audit", e)
+                    })?;
                 // Baseline written; arm for the next snapshot, exactly like
                 // the SoftDirty first window below. Both modes write the same
                 // cumulative pagemap-anon set; without arming here, the next
@@ -891,8 +847,8 @@ impl KvmVm {
                         &mappings,
                         file,
                         &ranges,
-                        skip_unchanged,
-                        verify_incremental_memory,
+                        false,
+                        false,
                     ) {
                         accounting.disarm();
                         return Err(MemoryBackingFile("write_all_at", e));
@@ -956,15 +912,8 @@ impl KvmVm {
                         stats.anon_pages,
                         stats.total_pages
                     );
-                    write_ranges_and_verify(
-                        guest_memory,
-                        &mappings,
-                        file,
-                        &ranges,
-                        skip_unchanged,
-                        verify_incremental_memory,
-                    )
-                    .map_err(|e| {
+                    write_ranges_and_verify(guest_memory, &mappings, file, &ranges, false, false)
+                        .map_err(|e| {
                         accounting.disarm();
                         MemoryBackingFile("write_all_at or incremental audit", e)
                     })?;
@@ -1019,7 +968,7 @@ impl KvmVm {
             );
             guest_memory.dump_dirty(file, &dirty_bitmap)?;
         }
-        write_ranges_at_offsets(guest_memory, &mappings, file, external_dirty_ranges)
+        write_ranges_at_offsets(guest_memory, &mappings, file, external_dirty_ranges, false)
             .map_err(|e| MemoryBackingFile("write_all_at", e))?;
         Ok(())
     }
@@ -1856,157 +1805,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_incremental_audit_failure_disarms_and_full_recovers() {
-        if full_window_probe_child(
-            "vstate::vm::tests::test_incremental_audit_failure_disarms_and_full_recovers",
-        ) {
-            return;
-        }
-        use std::os::unix::fs::FileExt;
-        use vmm_sys_util::tempfile::TempFile;
-
-        // A real KVM memory registration, without running a vCPU. No guest
-        // writes race the snapshot. The isolated process owns clear_refs.
-        let size = 4 * 1024 * 1024;
-        let vm = setup_vm_with_memory(size);
-        let mut expected = vec![0x51; size];
-        vm.guest_memory()
-            .write_slice(&expected, GuestAddress(0))
-            .unwrap();
-        let base = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(
-            base.as_path(),
-            SnapshotType::Full,
-            true,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-        assert!(vm.common.soft_dirty_accounting.is_armed());
-
-        // Corrupt a byte in a clean page of the base. An ordinary delta has
-        // no reason to overwrite it; full-image verification must reject it.
-        base.as_file().write_all_at(&[0], 4099).unwrap();
-        let error = vm
-            .snapshot_memory_to_file(
-                base.as_path(),
-                SnapshotType::SoftDirty,
-                true,
-                false,
-                true,
-                true,
-            )
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("incremental memory audit failed"),
-            "{error}"
-        );
-        assert!(!vm.common.soft_dirty_accounting.is_armed());
-
-        // Failed targets are not reusable lineage. A Full rebuild supplies
-        // a complete image and establishes a fresh window.
-        vm.snapshot_memory_to_file(
-            base.as_path(),
-            SnapshotType::Full,
-            true,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(base.as_path()).unwrap(), expected);
-        assert!(vm.common.soft_dirty_accounting.is_armed());
-        expected[8197] = 0x92;
-        vm.guest_memory()
-            .write_slice(&[0x92], GuestAddress(8197))
-            .unwrap();
-        vm.snapshot_memory_to_file(
-            base.as_path(),
-            SnapshotType::SoftDirty,
-            true,
-            false,
-            true,
-            true,
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(base.as_path()).unwrap(), expected);
-        assert!(vm.common.soft_dirty_accounting.is_armed());
-    }
-
-    #[test]
-    fn test_skip_unchanged_softdirty_window() {
-        if full_window_probe_child("vstate::vm::tests::test_skip_unchanged_softdirty_window") {
-            return;
-        }
-        use vmm_sys_util::tempfile::TempFile;
-        let size = 32 * 1024 * 1024;
-        let vm = setup_vm_with_memory(size);
-        let mut expected = vec![0x51; size];
-        vm.guest_memory()
-            .write_slice(&expected, GuestAddress(0))
-            .unwrap();
-        let full = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(
-            full.as_path(),
-            SnapshotType::Full,
-            true,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-        // Mark the entire mapping dirty while changing only a single byte.
-        vm.guest_memory()
-            .write_slice(&expected, GuestAddress(0))
-            .unwrap();
-        expected[4099] = 0xA9;
-        vm.guest_memory()
-            .write_slice(&[0xA9], GuestAddress(4099))
-            .unwrap();
-        let rejected = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(
-            rejected.as_path(),
-            SnapshotType::SoftDirty,
-            true,
-            false,
-            true,
-            false,
-        )
-        .unwrap_err();
-        let delta = TempFile::new().unwrap();
-        std::fs::copy(full.as_path(), delta.as_path()).unwrap();
-        fn wchar() -> u64 {
-            std::fs::read_to_string("/proc/self/io")
-                .unwrap()
-                .lines()
-                .find_map(|line| line.strip_prefix("wchar: "))
-                .unwrap()
-                .parse()
-                .unwrap()
-        }
-        let before = wchar();
-        vm.snapshot_memory_to_file(
-            delta.as_path(),
-            SnapshotType::SoftDirty,
-            true,
-            false,
-            true,
-            false,
-        )
-        .unwrap();
-        let actual = wchar() - before;
-        assert!(
-            (4096..8192).contains(&actual),
-            "unexpected write amplification: {actual}"
-        );
-        assert_eq!(std::fs::read(delta.as_path()).unwrap(), expected);
-        println!("filtered_softdirty_window candidate={size} wchar={actual} bytes_match=true");
-    }
-
-    #[test]
     fn test_full_then_softdirty_window_probe() {
         if full_window_probe_child("vstate::vm::tests::test_full_then_softdirty_window_probe") {
             return;
@@ -2028,15 +1826,8 @@ pub(crate) mod tests {
             .write_slice(&expected, GuestAddress(0))
             .unwrap();
         let full = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(
-            full.as_path(),
-            SnapshotType::Full,
-            true,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
+        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, &[], false)
+            .unwrap();
         let armed_after_full = vm.common.soft_dirty_accounting.is_armed();
         assert!(
             armed_after_full,
@@ -2049,15 +1840,8 @@ pub(crate) mod tests {
             .write_slice(&[0x7E], GuestAddress(3 * 4096 + 19))
             .unwrap();
         let before = wchar();
-        vm.snapshot_memory_to_file(
-            delta.as_path(),
-            SnapshotType::SoftDirty,
-            true,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
+        vm.snapshot_memory_to_file(delta.as_path(), SnapshotType::SoftDirty, true, &[], false)
+            .unwrap();
         let written = wchar() - before;
         assert_eq!(std::fs::read(delta.as_path()).unwrap(), expected);
         println!(
@@ -2071,151 +1855,6 @@ pub(crate) mod tests {
             (4096..8192).contains(&written),
             "single-page delta was amplified: {written}"
         );
-    }
-
-    #[test]
-    fn test_full_reopens_window_and_failed_full_preserves_it() {
-        if full_window_probe_child(
-            "vstate::vm::tests::test_full_reopens_window_and_failed_full_preserves_it",
-        ) {
-            return;
-        }
-        use vmm_sys_util::tempfile::TempFile;
-        fn wchar() -> u64 {
-            std::fs::read_to_string("/proc/self/io")
-                .unwrap()
-                .lines()
-                .find_map(|line| line.strip_prefix("wchar: "))
-                .unwrap()
-                .parse()
-                .unwrap()
-        }
-        let size = 8 * 1024 * 1024;
-        let vm = setup_vm_with_memory(size);
-        let mut expected = vec![0x41; size];
-        vm.guest_memory()
-            .write_slice(&expected, GuestAddress(0))
-            .unwrap();
-        let full = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(
-            full.as_path(),
-            SnapshotType::Full,
-            false,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-        expected[4099] = 0xA1;
-        vm.guest_memory()
-            .write_slice(&[0xA1], GuestAddress(4099))
-            .unwrap();
-        // This write belongs to the newer Full, not its following delta.
-        vm.snapshot_memory_to_file(
-            full.as_path(),
-            SnapshotType::Full,
-            true,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-        expected[3 * 4096 + 11] = 0xB2;
-        vm.guest_memory()
-            .write_slice(&[0xB2], GuestAddress(3 * 4096 + 11))
-            .unwrap();
-        // A rejected sparse Full must not reset the pending dirty window.
-        vm.snapshot_memory_to_file(full.as_path(), SnapshotType::Full, true, true, false, false)
-            .unwrap_err();
-        let delta = TempFile::new().unwrap();
-        std::fs::copy(full.as_path(), delta.as_path()).unwrap();
-        let before = wchar();
-        vm.snapshot_memory_to_file(
-            delta.as_path(),
-            SnapshotType::SoftDirty,
-            true,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-        let written = wchar() - before;
-        assert_eq!(std::fs::read(delta.as_path()).unwrap(), expected);
-        assert!(
-            (4096..8192).contains(&written),
-            "Full did not reset the old window: {written}"
-        );
-        println!("repeated_full_window_probe wchar_delta={written}");
-    }
-
-    #[test]
-    fn test_sparse_full_snapshot_file() {
-        use std::os::unix::fs::MetadataExt;
-        use vmm_sys_util::tempfile::TempFile;
-        let vm = setup_vm_with_memory(2 * 1024 * 1024);
-        vm.guest_memory()
-            .write_slice(&[0xA7], GuestAddress(4099))
-            .unwrap();
-        let dense = TempFile::new().unwrap();
-        vm.snapshot_memory_to_file(
-            dense.as_path(),
-            SnapshotType::Full,
-            false,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-        let sparse = TempFile::new().unwrap();
-        // Reject an existing target without altering it, including a symlink.
-        std::fs::write(sparse.as_path(), b"preserve").unwrap();
-        vm.snapshot_memory_to_file(
-            sparse.as_path(),
-            SnapshotType::Full,
-            false,
-            true,
-            false,
-            false,
-        )
-        .unwrap_err();
-        assert_eq!(std::fs::read(sparse.as_path()).unwrap(), b"preserve");
-        std::fs::remove_file(sparse.as_path()).unwrap();
-        std::os::unix::fs::symlink(dense.as_path(), sparse.as_path()).unwrap();
-        vm.snapshot_memory_to_file(
-            sparse.as_path(),
-            SnapshotType::Full,
-            false,
-            true,
-            false,
-            false,
-        )
-        .unwrap_err();
-        std::fs::remove_file(sparse.as_path()).unwrap();
-        vm.snapshot_memory_to_file(
-            sparse.as_path(),
-            SnapshotType::Full,
-            false,
-            true,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            std::fs::read(dense.as_path()).unwrap(),
-            std::fs::read(sparse.as_path()).unwrap()
-        );
-        let metadata = std::fs::metadata(sparse.as_path()).unwrap();
-        assert_eq!(metadata.len(), 2 * 1024 * 1024);
-        assert!(metadata.blocks() * 512 < metadata.len());
-        vm.snapshot_memory_to_file(
-            sparse.as_path(),
-            SnapshotType::SoftDirty,
-            false,
-            true,
-            false,
-            false,
-        )
-        .unwrap_err();
     }
 
     #[test]

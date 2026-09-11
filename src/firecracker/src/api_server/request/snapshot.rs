@@ -62,37 +62,6 @@ pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, Request
 fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
 
-    if snapshot_config.sparse_full
-        && (snapshot_config.state_only || snapshot_config.snapshot_type != SnapshotType::Full)
-    {
-        return Err(RequestError::SerdeJson(serde_json::Error::custom(
-            "sparse_full requires a Full memory snapshot",
-        )));
-    }
-
-    if snapshot_config.skip_unchanged
-        && (snapshot_config.state_only
-            || !matches!(
-                snapshot_config.snapshot_type,
-                SnapshotType::Incremental | SnapshotType::SoftDirty
-            ))
-    {
-        return Err(RequestError::SerdeJson(serde_json::Error::custom(
-            "skip_unchanged requires an incremental memory snapshot",
-        )));
-    }
-    if snapshot_config.verify_incremental_memory
-        && (snapshot_config.state_only
-            || !matches!(
-                snapshot_config.snapshot_type,
-                SnapshotType::Incremental | SnapshotType::SoftDirty
-            ))
-    {
-        return Err(RequestError::SerdeJson(serde_json::Error::custom(
-            "verify_incremental_memory requires an incremental memory snapshot",
-        )));
-    }
-
     // A create request must either write the memory file or explicitly opt
     // into a state-only snapshot; an accidentally omitted `mem_file_path`
     // must stay an error (the pre-fork contract) instead of silently

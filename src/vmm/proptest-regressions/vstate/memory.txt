@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2764b066a9f0dea25040ec07f6f2de94316f0003054fb5fc0a964cbbcb79e968 # shrinks to region_specs = [RegionSpec { gap_pages: 7, region_type: Dram, pages_per_slot: 10, plugged: [true], kvm_bitmaps: [[775]], fc_dirty_pages: [[true, true, true, false, false, false, true, false, true, false]] }, RegionSpec { gap_pages: 8, region_type: Dram, pages_per_slot: 17, plugged: [true], kvm_bitmaps: [[9567]], fc_dirty_pages: [[true, true, false, false, false, true, true, false, true, true, false, true, true, true, false, false, false]] }]
