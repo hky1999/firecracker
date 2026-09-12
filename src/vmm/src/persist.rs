@@ -740,7 +740,7 @@ fn guest_memory_from_shared_file(
     const FICLONE: libc::c_ulong = 0x4004_9409;
     // SAFETY: both descriptors are valid regular files and the ioctl only
     // clones extents from the read-only source into the newly created target.
-    let result = unsafe { libc::ioctl(live.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+    let result = unsafe { libc::ioctl(live.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
     if result != 0 {
         // Reflink is the fast path, not a correctness requirement. A new
         // independent live file is still safe on filesystems without
