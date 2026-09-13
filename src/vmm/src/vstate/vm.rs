@@ -651,6 +651,13 @@ impl KvmVm {
         file.set_len(expected_size)
             .map_err(|e| MemoryBackingFile("set_length", e))?;
 
+        // A sparse incremental target (fresh baseless window) must only ever
+        // receive whole grid-aligned chunks; a dense base is patched as-is.
+        let align_sparse_target = matches!(
+            snapshot_type,
+            SnapshotType::Incremental | SnapshotType::SoftDirty
+        ) && memory_target_is_sparse(&file);
+
         match snapshot_type {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
@@ -683,6 +690,7 @@ impl KvmVm {
                     snapshot_type,
                     external_dirty_ranges,
                     include_kvm_dirty,
+                    align_sparse_target,
                 )?;
             }
         };
@@ -733,12 +741,14 @@ impl KvmVm {
     /// fsync/manifest commit when true — either way arming precedes durable
     /// storage, which is sound because the caller discards artifacts it
     /// never committed.
+    #[allow(clippy::too_many_arguments)]
     fn snapshot_memory_incremental(
         &self,
         file: &mut File,
         snapshot_type: SnapshotType,
         external_dirty_ranges: &[MemoryRange],
         include_kvm_dirty: bool,
+        align_sparse_target: bool,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -765,6 +775,11 @@ impl KvmVm {
                             return Err(e.into());
                         }
                     };
+                let ranges = if align_sparse_target {
+                    align_ranges_to_grid(ranges, SNAPSHOT_CHUNK_ALIGN_BYTES)
+                } else {
+                    ranges
+                };
                 let t_write = std::time::Instant::now();
                 debug!(
                     "Incremental snapshot: {} anon ranges, {} of {} pages",
@@ -834,6 +849,11 @@ impl KvmVm {
                         }
                         Err(IntersectionError::Anon(e)) => return Err(e.into()),
                         Err(IntersectionError::SoftDirty(e)) => return Err(e.into()),
+                    };
+                    let ranges = if align_sparse_target {
+                        align_ranges_to_grid(ranges, SNAPSHOT_CHUNK_ALIGN_BYTES)
+                    } else {
+                        ranges
                     };
                     let t_write = std::time::Instant::now();
                     debug!(
@@ -905,6 +925,11 @@ impl KvmVm {
                                 return Err(e.into());
                             }
                         };
+                    let ranges = if align_sparse_target {
+                        align_ranges_to_grid(ranges, SNAPSHOT_CHUNK_ALIGN_BYTES)
+                    } else {
+                        ranges
+                    };
                     let t_write = std::time::Instant::now();
                     debug!(
                         "Soft-dirty baseline snapshot: {} anon ranges, {} of {} pages",
@@ -968,7 +993,12 @@ impl KvmVm {
             );
             guest_memory.dump_dirty(file, &dirty_bitmap)?;
         }
-        write_ranges_at_offsets(guest_memory, &mappings, file, external_dirty_ranges, false)
+        let external_ranges = if align_sparse_target {
+            align_ranges_to_grid(external_dirty_ranges.to_vec(), SNAPSHOT_CHUNK_ALIGN_BYTES)
+        } else {
+            external_dirty_ranges.to_vec()
+        };
+        write_ranges_at_offsets(guest_memory, &mappings, file, &external_ranges, false)
             .map_err(|e| MemoryBackingFile("write_all_at", e))?;
         Ok(())
     }
@@ -1349,6 +1379,80 @@ fn verify_incremental_memory_image(
     Ok(())
 }
 
+/// The chunk grid incremental writes are rounded out to on sparse targets.
+/// It MUST stay in lockstep with sandboxd's `checkpointchunks.DefaultChunkBytes`
+/// (256 KiB): the consumer seals the memory file into content-addressed
+/// chunks on this grid, and a chunk that is only partially written has a
+/// hole tail whose bytes belong to the parent generation — bytes the local
+/// file cannot represent.
+pub(crate) const SNAPSHOT_CHUNK_ALIGN_BYTES: u64 = 256 << 10;
+
+/// Round incremental write ranges OUT to a byte grid and merge overlaps.
+///
+/// A baseless incremental snapshot writes into a sparse file whose holes are
+/// "bytes the parent generation still owns": only a WHOLE grid cell of local
+/// data is representable by a local digest, because any hole inside a cell
+/// would have to carry the parent's bytes, which the local file does not
+/// have. Aligning every range to the grid (and merging the now-adjacent
+/// cells) guarantees each written cell is complete; the extra bytes a
+/// rounded-out cell adds are simply the guest's current memory, read from
+/// the same paused VM, so they are always correct — the write set grows, it
+/// never changes meaning.
+fn align_ranges_to_grid(ranges: Vec<MemoryRange>, align: u64) -> Vec<MemoryRange> {
+    if align == 0 || ranges.is_empty() {
+        return ranges;
+    }
+    // The ledger walks produce address-ordered ranges; sorting keeps the
+    // merge below correct even if a future source does not.
+    let mut ranges = ranges;
+    ranges.sort_by_key(|r| r.gpa);
+    let mut aligned: Vec<MemoryRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let start = range.gpa - range.gpa % align;
+        let end = range.gpa + range.length;
+        let end = end + (align - end % align) % align;
+        let candidate = MemoryRange {
+            gpa: start,
+            length: end - start,
+        };
+        match aligned.last_mut() {
+            Some(last) if last.gpa + last.length >= candidate.gpa => {
+                let end = last.gpa + last.length;
+                let candidate_end = candidate.gpa + candidate.length;
+                if candidate_end > end {
+                    last.length = candidate_end - last.gpa;
+                }
+            }
+            _ => aligned.push(candidate),
+        }
+    }
+    aligned
+}
+
+/// Reports whether the memory target carries holes, i.e. some regions read
+/// as zeros without allocated extents. A baseless incremental target is a
+/// freshly preallocated sparse file (every unwritten byte is a hole owned
+/// by the parent generation), while a patch-in-place base is fully
+/// allocated — the presence of any hole is exactly the condition under
+/// which partially written chunks could appear, and therefore under which
+/// writes must be grid-aligned. On filesystems without extent queries the
+/// answer defaults to true: alignment is always semantically correct,
+/// merely marginally wider.
+fn memory_target_is_sparse(file: &File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        return false;
+    }
+    // SAFETY: the descriptor is owned by `file` and remains open for the
+    // call; lseek does not touch memory beyond the returned offset.
+    let hole = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) };
+    if hole < 0 {
+        return true;
+    }
+    hole.cast_unsigned() < size
+}
+
 fn write_ranges_and_verify(
     guest_memory: &GuestMemoryMmap,
     mappings: &[RegionFileMapping],
@@ -1441,6 +1545,75 @@ fn write_ranges_at_offsets(
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn test_align_ranges_to_grid() {
+        let mk = |gpa: u64, length: u64| MemoryRange { gpa, length };
+        // Zero alignment is a no-op.
+        let ranges = vec![mk(0x123_000, 0x2000)];
+        assert_eq!(align_ranges_to_grid(ranges.clone(), 0), ranges);
+
+        // A mid-cell range rounds out to whole 256KiB cells.
+        let aligned = align_ranges_to_grid(vec![mk(0x00_4000, 0x2000)], 0x40000);
+        assert_eq!(aligned, vec![mk(0x0, 0x40000)]);
+
+        // Ranges in neighboring cells merge into one span.
+        let aligned =
+            align_ranges_to_grid(vec![mk(0x3_0000, 0x1000), mk(0x4_1000, 0x1000)], 0x40000);
+        assert_eq!(aligned, vec![mk(0x0, 0x8_0000)]);
+
+        // A range spanning several cells covers them all exactly.
+        let aligned = align_ranges_to_grid(vec![mk(0x5_0000, 0x2_0000)], 0x40000);
+        assert_eq!(aligned, vec![mk(0x4_0000, 0x4_0000)]);
+
+        // Unsorted input still merges by address.
+        let aligned =
+            align_ranges_to_grid(vec![mk(0x9_0000, 0x1000), mk(0x1_0000, 0x1000)], 0x40000);
+        assert_eq!(aligned, vec![mk(0x0, 0x4_0000), mk(0x8_0000, 0x4_0000)]);
+    }
+
+    #[test]
+    fn test_memory_target_is_sparse() {
+        use vmm_sys_util::tempfile::TempFile;
+        let dense = TempFile::new().unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dense.as_path())
+                .unwrap();
+            f.write_all(&vec![7u8; 64 << 10]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let f = std::fs::File::open(dense.as_path()).unwrap();
+        assert!(!memory_target_is_sparse(&f));
+
+        let sparse = TempFile::new().unwrap();
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(sparse.as_path())
+                .unwrap();
+            f.set_len(64 << 10).unwrap();
+        }
+        let f = std::fs::File::open(sparse.as_path()).unwrap();
+        assert!(memory_target_is_sparse(&f));
+
+        // A partially written sparse target stays sparse: the unwritten tail
+        // is still a hole.
+        let partial = TempFile::new().unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(partial.as_path())
+                .unwrap();
+            f.set_len(64 << 10).unwrap();
+            f.write_all(&vec![7u8; 16 << 10]).unwrap();
+        }
+        let f = std::fs::File::open(partial.as_path()).unwrap();
+        assert!(memory_target_is_sparse(&f));
+    }
 
     use vm_memory::GuestAddress;
     use vm_memory::mmap::MmapRegionBuilder;
