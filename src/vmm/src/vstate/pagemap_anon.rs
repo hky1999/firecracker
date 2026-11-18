@@ -7,18 +7,21 @@
 //! Ported from CubeSandbox (Cloud Hypervisor fork) `pagemap_anon.rs` and
 //! adapted to Firecracker's memory types.
 //!
-//! This module provides functionality for creating pagemap-anon-based
-//! snapshots that only save CoW anonymous pages (pages actually written by
-//! the Guest) by inspecting `/proc/self/pagemap` and `/proc/kpageflags`.
+//! Selects private anonymous guest pages using `/proc/self/pagemap`.
 //!
-//! In a `MAP_PRIVATE` mmap restore scenario:
-//! - Pages only read by Guest remain as file-backed page cache (KPF_ANON=0)
-//! - Pages written by Guest trigger CoW and become anonymous pages (KPF_ANON=1)
-//! - Pages never accessed have no PTE (present=0)
+//! A present page whose bit 61 is clear is private anonymous memory; a
+//! file-backed or shared-anonymous page has that bit set. In a MAP_PRIVATE
+//! restore, guest writes create private pages while read-only pages continue
+//! to refer to the base file. Swapped pages are included conservatively.
 //!
-//! This module filters out only the anonymous pages, significantly reducing
-//! snapshot size compared to mincore which also saves read-only page cache
-//! pages.
+//! Do not resolve a pagemap PFN through `/proc/kpageflags`: NUMA migration can
+//! replace that PFN between the two reads, so flags may describe a freed or
+//! reused page and silently omit live guest data. This classification also
+//! works when CAP_SYS_ADMIN restrictions hide PFNs.
+//!
+//! Faulted shared zero pages are included conservatively. They cannot be
+//! distinguished from private pages using these bits alone. The result is
+//! a superset of the former KPF_ANON selection, not a physical-page census.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -113,20 +116,20 @@ pub(crate) fn coalesce_pages_to_ranges(
 /// Size of a pagemap entry in bytes
 const PAGEMAP_ENTRY_SIZE: usize = 8;
 
-/// Size of a kpageflags entry in bytes
-const KPAGEFLAGS_ENTRY_SIZE: usize = 8;
-
 /// Bit 63: page is present in RAM
 const PAGEMAP_PRESENT_BIT: u64 = 1 << 63;
 
 /// Bit 62: page is in swap
 const PAGEMAP_SWAPPED_BIT: u64 = 1 << 62;
 
-/// Mask for PFN (bits 0-54)
-const PAGEMAP_PFN_MASK: u64 = (1 << 55) - 1;
+/// Bit 61: file-backed page or shared-anonymous page.
+const PAGEMAP_FILE_OR_SHARED_ANON_BIT: u64 = 1 << 61;
 
-/// Bit 12 in kpageflags: KPF_ANON (anonymous page)
-const KPF_ANON: u64 = 1 << 12;
+/// Classify the page from a single pagemap entry, without a racy PFN lookup.
+fn pagemap_entry_reports_private(entry: u64) -> bool {
+    entry & PAGEMAP_SWAPPED_BIT != 0
+        || (entry & PAGEMAP_PRESENT_BIT != 0 && entry & PAGEMAP_FILE_OR_SHARED_ANON_BIT == 0)
+}
 
 /// Errors related to pagemap_anon operations
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -161,7 +164,7 @@ pub enum PagemapAnonError {
     /// Memory region not aligned to page boundary
     NotPageAligned,
 
-    /// No CAP_SYS_ADMIN permission: PFN is zero for a present page, cannot read kpageflags
+    /// Legacy PFN-based classifier could not read kpageflags without CAP_SYS_ADMIN
     NoCapSysAdmin,
 }
 
@@ -173,7 +176,7 @@ pub type Result<T> = std::result::Result<T, PagemapAnonError>;
 pub struct PagemapAnonStats {
     /// Total number of pages in the memory regions
     pub total_pages: u64,
-    /// Number of anonymous pages (CoW pages written by Guest)
+    /// Private pages selected, conservatively including faulted zero pages
     pub anon_pages: u64,
     /// Number of pages that are swapped out (also counted as anon)
     pub swapped_pages: u64,
@@ -193,8 +196,7 @@ impl PagemapAnonStats {
     }
 }
 
-/// Get the anonymous page bitmap for a memory region by reading
-/// `/proc/self/pagemap` and `/proc/kpageflags`.
+/// Get a conservative private-page bitmap using only `/proc/self/pagemap`.
 ///
 /// # Arguments
 /// * `host_addr` - Host virtual address of the memory region (must be page-aligned)
@@ -202,9 +204,9 @@ impl PagemapAnonStats {
 ///
 /// # Returns
 /// A vector of bools where each bool indicates if the corresponding page
-/// is an anonymous page (CoW written by Guest).
-/// Returns one bool per host page (true = anonymous: written while
-/// MAP_PRIVATE, or swapped out) plus the number of swapped-out anonymous
+/// is private anonymous memory (including a faulted shared zero page).
+/// Returns one bool per host page (true = private, including a faulted
+/// zero page, or swapped out) plus the number of swapped-out anonymous
 /// pages seen while scanning; those pages are `true` in the bitmap and
 /// counted separately for the stats logging.
 pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<(Vec<bool>, u64)> {
@@ -217,16 +219,10 @@ pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<(Vec<bool>, u64)> {
         usize::try_from(length.div_ceil(page_size)).expect("page count must fit in usize");
     let start_page = host_addr / page_size;
 
-    // Open /proc/self/pagemap and /proc/kpageflags
+    // Read classification and residency from the same page-table snapshot.
     let mut pagemap_file =
         File::open("/proc/self/pagemap").map_err(|e| PagemapAnonError::OpenFailed {
             path: "/proc/self/pagemap".to_string(),
-            source: e,
-        })?;
-
-    let mut kpageflags_file =
-        File::open("/proc/kpageflags").map_err(|e| PagemapAnonError::OpenFailed {
-            path: "/proc/kpageflags".to_string(),
             source: e,
         })?;
 
@@ -250,62 +246,10 @@ pub fn get_anon_pages(host_addr: u64, length: u64) -> Result<(Vec<bool>, u64)> {
 
     let mut result = vec![false; num_pages];
     let mut swapped_pages = 0u64;
-    let mut kpageflags_buf = [0u8; KPAGEFLAGS_ENTRY_SIZE];
-
-    for (i, item) in result.iter_mut().enumerate().take(num_pages) {
-        let entry_offset = i * PAGEMAP_ENTRY_SIZE;
-        let entry = u64::from_ne_bytes(
-            pagemap_buf[entry_offset..entry_offset + PAGEMAP_ENTRY_SIZE]
-                .try_into()
-                .unwrap(),
-        );
-
-        let present = (entry & PAGEMAP_PRESENT_BIT) != 0;
-        let swapped = (entry & PAGEMAP_SWAPPED_BIT) != 0;
-
-        // Swapped anonymous pages are also Guest-written pages that must be
-        // saved. When an anonymous page is swapped out, present=0 but
-        // swapped=1.
-        if swapped {
-            *item = true;
-            swapped_pages += 1;
-            continue;
-        }
-
-        if !present {
-            continue;
-        }
-
-        let pfn = entry & PAGEMAP_PFN_MASK;
-        if pfn == 0 {
-            // PFN is zero for a present page — this means we don't have
-            // CAP_SYS_ADMIN permission to read PFN from pagemap.
-            return Err(PagemapAnonError::NoCapSysAdmin);
-        }
-
-        // Read kpageflags for this PFN
-        let kpageflags_offset = pfn * KPAGEFLAGS_ENTRY_SIZE as u64;
-        kpageflags_file
-            .seek(SeekFrom::Start(kpageflags_offset))
-            .map_err(|e| PagemapAnonError::SeekFailed {
-                path: "/proc/kpageflags".to_string(),
-                source: e,
-            })?;
-
-        kpageflags_file
-            .read_exact(&mut kpageflags_buf)
-            .map_err(|e| PagemapAnonError::ReadFailed {
-                path: "/proc/kpageflags".to_string(),
-                source: e,
-            })?;
-
-        let flags = u64::from_ne_bytes(kpageflags_buf);
-
-        // KPF_ANON (bit 12) indicates this is an anonymous page,
-        // meaning it was created by CoW when Guest wrote to it.
-        if (flags & KPF_ANON) != 0 {
-            *item = true;
-        }
+    for (item, bytes) in result.iter_mut().zip(pagemap_buf.chunks_exact(8)) {
+        let entry = u64::from_ne_bytes(bytes.try_into().unwrap());
+        *item = pagemap_entry_reports_private(entry);
+        swapped_pages += u64::from(entry & PAGEMAP_SWAPPED_BIT != 0);
     }
 
     Ok((result, swapped_pages))
@@ -352,7 +296,7 @@ pub fn filter_memory_ranges_by_pagemap_anon(
             .get_host_address(GuestAddress(gpa))
             .map_err(|_| PagemapAnonError::GetHostAddressFailed)?;
 
-        // Get anonymous page bitmap via pagemap + kpageflags
+        // Get a conservative private-page bitmap directly from pagemap.
         let (anon_pages, swapped) = get_anon_pages(host_addr as u64, length)?;
         stats.swapped_pages += swapped;
 
@@ -439,8 +383,89 @@ mod tests {
         // Verify bit positions are correct
         assert_eq!(PAGEMAP_PRESENT_BIT, 1u64 << 63);
         assert_eq!(PAGEMAP_SWAPPED_BIT, 1u64 << 62);
-        assert_eq!(PAGEMAP_PFN_MASK, (1u64 << 55) - 1);
-        assert_eq!(KPF_ANON, 1u64 << 12);
+        assert_eq!(PAGEMAP_FILE_OR_SHARED_ANON_BIT, 1u64 << 61);
+    }
+
+    #[test]
+    fn test_private_classification_does_not_depend_on_pfn() {
+        // Migration may free/reuse the PFN captured by a previous read.
+        // Hidden PFNs and either old/new physical frame must classify alike.
+        for pfn in [0, 1, 0x12345, (1u64 << 55) - 1] {
+            assert!(pagemap_entry_reports_private(PAGEMAP_PRESENT_BIT | pfn));
+            assert!(!pagemap_entry_reports_private(
+                PAGEMAP_PRESENT_BIT | PAGEMAP_FILE_OR_SHARED_ANON_BIT | pfn
+            ));
+        }
+        assert!(!pagemap_entry_reports_private(0));
+        assert!(!pagemap_entry_reports_private(1 << 55));
+        assert!(pagemap_entry_reports_private(PAGEMAP_SWAPPED_BIT));
+    }
+
+    #[test]
+    fn test_faulted_zero_page_is_included_conservatively() {
+        let page = usize::try_from(host_page_size()).unwrap();
+        // SAFETY: anonymous private mapping, used only until munmap below.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        // SAFETY: this read is within the freshly allocated mapping.
+        assert_eq!(unsafe { std::ptr::read_volatile(address.cast::<u8>()) }, 0);
+        let classified = get_anon_pages(address as u64, (2 * page) as u64);
+        // SAFETY: the mapping is no longer used after this call.
+        assert_eq!(unsafe { libc::munmap(address, 2 * page) }, 0);
+        assert_eq!(classified.unwrap(), (vec![true, false], 0));
+    }
+
+    #[test]
+    fn test_private_file_mapping_selects_cow_and_retains_readonly_base() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        use vmm_sys_util::tempfile::TempFile;
+
+        let page = usize::try_from(host_page_size()).unwrap();
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len((4 * page) as u64).unwrap();
+        file.as_file()
+            .write_all_at(&vec![0x31; 4 * page], 0)
+            .unwrap();
+        // SAFETY: valid file range; the mapping is unmapped below after use.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let ptr = address.cast::<u8>();
+        // SAFETY: all offsets are within this writable private mapping.
+        unsafe {
+            assert_eq!(std::ptr::read_volatile(ptr), 0x31);
+            std::ptr::write_volatile(ptr.add(page), 0x72);
+            assert_eq!(std::ptr::read_volatile(ptr.add(3 * page)), 0x31);
+        }
+        let classified = get_anon_pages(address as u64, (4 * page) as u64);
+        // SAFETY: the original mapping is no longer used after this call.
+        assert_eq!(unsafe { libc::munmap(address, 4 * page) }, 0);
+        let (bitmap, swapped) = classified.unwrap();
+        assert_eq!(bitmap, [false, true, false, false]);
+        assert_eq!(swapped, 0);
+        let mut original = [0u8; 1];
+        file.as_file()
+            .read_exact_at(&mut original, page as u64)
+            .unwrap();
+        assert_eq!(original, [0x31], "CoW must not change the input file");
     }
 
     /// Coalescing must produce byte offsets/lengths scaled by the *injected*

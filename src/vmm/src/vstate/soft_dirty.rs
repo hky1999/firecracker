@@ -585,8 +585,8 @@ pub fn filter_memory_ranges_by_anon_and_soft_dirty(
                 IntersectionError::Anon(pagemap_anon::PagemapAnonError::GetHostAddressFailed)
             })?;
 
-        // Both ledgers read from /proc/self/pagemap; anon additionally
-        // consults /proc/kpageflags per present page.
+        // Both ledgers read from /proc/self/pagemap; private classification
+        // does not consult physical flags, which can race with migration.
         let (anon_bitmap, _swapped) = pagemap_anon::get_anon_pages(host_addr as u64, length)
             .map_err(IntersectionError::Anon)?;
         let soft_dirty_bitmap =
